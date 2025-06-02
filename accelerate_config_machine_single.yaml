@@ -1,0 +1,66 @@
+# compute_environment: LOCAL_MACHINE
+# main_process_port: 29502
+# debug: false
+# deepspeed_config:
+#   gradient_accumulation_steps: 1
+#   gradient_clipping: 1.0
+#   offload_optimizer_device: none
+#   offload_param_device: none
+#   zero3_init_flag: false
+#   zero_stage: 2
+#   fp16:
+#     enabled: false
+#   bf16:
+#     enabled: false
+# distributed_type: DEEPSPEED
+# downcast_bf16: 'yes'
+# enable_cpu_affinity: false
+# machine_rank: 0
+# main_training_function: main
+# dynamo_backend: 'no'
+# mixed_precision: 'no'
+# num_machines: 1
+# num_processes: 1
+# rdzv_backend: static
+# same_network: true
+# tpu_env: []
+# tpu_use_cluster: false
+# tpu_use_sudo: false
+# use_cpu: false
+
+# accelerate_config.yaml
+compute_environment: LOCAL_MACHINE
+main_process_port: 29502
+debug: false
+
+deepspeed_config:
+  # Explicitly disable both fp16 and bf16 under DeepSpeed:
+  fp16:
+    enabled: false
+  bf16:
+    enabled: false
+
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero_stage: 2
+
+distributed_type: DEEPSPEED
+
+# Top‐level “mixed_precision” must be “no” so that Accelerate never autocasts:
+mixed_precision: 'no'
+
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+dynamo_backend: 'no'
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
