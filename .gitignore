@@ -1,3 +1,6 @@
 __pycache__/
 triton_cache_dir/
 wandb/
+test.ipynb
+inference.ipynb
+videoOut/
