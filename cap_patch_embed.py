@@ -523,8 +523,7 @@ class CAPPatchEmbed(nn.Module):
         # self.audio_embed_proj.weight.data *= 0.
         # self.audio_embed_proj.bias.data *= 0.
         self.audio_proj = nn.Linear(audio_embed_dim * self.temporal_compression_ratio, embed_dim)
-        # self.audio_proj.weight.data *= 0.
-        # self.audio_proj.bias.data *= 0.
+  
 
         self.ref_temp_proj = nn.Linear(2, embed_dim // 4)
 

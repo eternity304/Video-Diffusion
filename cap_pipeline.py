@@ -16,7 +16,7 @@ from diffusers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import CogVideoXPipelineOutput, CogVideoXLoraLoaderMixin
 
-from cap_transformer import CAPVideoXTransformer3DModel
+from cap_video.cap_transformer import CAPVideoXTransformer3DModel
 
 
 def resize_for_crop(image, crop_h, crop_w):

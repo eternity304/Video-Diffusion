@@ -122,7 +122,7 @@ class VideoDataset(Dataset):
         # 3. Build the “reference mask”: shape [1, F_req, H, W], float32 {0,1}.
         #    First num_ref frames are reference → mask=1; rest mask=0.
         # --------------------------------------------------------------------------------
-        ref_mask = torch.zeros((F_req, *self.resize_hw), dtype=torch.float32)
+        ref_mask = torch.zeros((F_req, *self.resize_hw, 3), dtype=torch.float32)
         ref_mask[: self.num_ref] = 1.0
 
         # Add batch‐dim → [1, F_req, H, W]
@@ -132,7 +132,7 @@ class VideoDataset(Dataset):
         # 4. Build chunk_is_ref: a length‐F_req boolean vector, True for reference frames
         # --------------------------------------------------------------------------------
         chunk_is_ref = torch.zeros(F_req, dtype=torch.bool)
-        chunk_is_ref[: self.num_ref] = True
+        # chunk_is_ref[: self.num_ref] = True
 
         # --------------------------------------------------------------------------------
         # 5. Package into the format training loop expects:
