@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from ..CustomDataset import VideoDataset                   # Your custom Dataset
 from ..cap_transformer import CAPVideoXTransformer3DModel   # Your 3D transformer class
-from ..trainUtils import *                                  # E.g. get_optimizer(), etc.
+from ..train.trainUtils import *                                  # E.g. get_optimizer(), etc.
 
 #
 # ——— Helper functions from the “reference pipeline” ———
