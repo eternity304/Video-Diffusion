@@ -33,7 +33,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
 
-from cap_patch_embed import CAPPatchEmbed
+from model.cap_patch_embed import CAPPatchEmbed
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
