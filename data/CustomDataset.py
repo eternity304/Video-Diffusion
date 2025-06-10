@@ -132,7 +132,6 @@ class VideoDataset(Dataset):
         # 4. Build chunk_is_ref: a length‐F_req boolean vector, True for reference frames
         # --------------------------------------------------------------------------------
         chunk_is_ref = torch.zeros(F_req, dtype=torch.bool)
-        # chunk_is_ref[: self.num_ref] = True
 
         # --------------------------------------------------------------------------------
         # 5. Package into the format training loop expects:
@@ -146,9 +145,4 @@ class VideoDataset(Dataset):
             "cond_chunks":        {"ref_mask": [ref_mask]}, # list length=1 inside dict
             "chunk_is_ref":       [chunk_is_ref],          # list length=1
             "raw_audio":          None,
-            # If your training loop later tries to read batch["audio"] or batch["has_audio"],
-            # you could put dummy entries like:
-            # "audio": torch.zeros((1, some_length, some_dim)),
-            # "has_audio": [False],
-            # "sample_positions": torch.zeros((1, some_length)),
         }

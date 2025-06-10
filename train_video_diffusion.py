@@ -310,6 +310,7 @@ def main():
                     ref_mask_chunks.append(mask_down.to(dtype=weight_dtype))
                     mask_cond = mask_down.permute(0, 2, 1, 3, 4)
                     cond_mask_chunks.append(mask_cond.to(dtype=weight_dtype))
+
                 # 3. build cond chunks of length 1 from ref_mask_chunks
                 cond_chunks = [ rm for rm in cond_mask_chunks ]
 
