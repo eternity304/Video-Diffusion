@@ -240,9 +240,7 @@ def main():
             models_to_accumulate =  [transformer]
             with accelerator.accumulate(models_to_accumulate): 
                 latent_chunks = []
-                permuted_latents = []
                 ref_mask_chunks = []
-                cond_mask_chunks = []
 
                 # Initialize necessary data for diffusion
                 for i, video in enumerate(batch["video_chunks"]):
@@ -280,7 +278,7 @@ def main():
                     video = video.to(accelerator.device).to(weight_dtype)
                     noise = torch.randn_like(video)
                     noise[:, :, 0, :, :] = 0
-                    video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise, timestep).to(weight_dtype)
+                    video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise[:, :, 1:, :, :], timesteps).to(weight_dtype)
                     noised_latents.append(encode_video(vae, video))
 
                 # Trivial Audio, Text, and Condition
@@ -321,7 +319,6 @@ def main():
                 target = model_input
 
                 loss = (weights * (model_pred - target) ** 2)
-                loss = loss * non_ref_mask / non_ref_mask.mean()
                 loss = torch.mean(loss.reshape(B, -1), dim=1)
                 loss = loss.mean()
                 accelerator.backward(loss)
