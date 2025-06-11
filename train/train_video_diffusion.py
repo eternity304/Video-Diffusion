@@ -23,7 +23,7 @@ import os
 import argparse
 import sys
 
-sys.chdir("..")
+os.chdir("..")
 
 def main():
     # Load Model Config
@@ -144,11 +144,11 @@ def main():
             weight_dtype = torch.float32
 
     def unwrap_model(m):
-            m = accelerator.unwrap_model(m)
-            return m._orig_mod if hasattr(m, "_orig_mod") else m
+        m = accelerator.unwrap_model(m)
+        return m._orig_mod if hasattr(m, "_orig_mod") else m
 
-    transformer.to(accelerator.device)
-    vae.to(accelerator.device)
+    transformer.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
 
     trainable_parameters =  list(filter(lambda p: p.requires_grad, transformer.parameters()))
     params_to_optimize = [{"params": trainable_parameters, "lr": args.learning_rate}]
@@ -243,7 +243,7 @@ def main():
                     # Initiate the Remainder Frames As Gaussian Noise
                     # Initial video has shape [B, C, F, H, W]
                     # video[:, :, 1:, :, :] = torch.randn(video[:, :, 1:, :, :].shape)
-                    video.to(accelerator.device).to(weight_dtype)
+                    video = video.to(accelerator.device).to(weight_dtype)
             
                     # Encode Video
                     with torch.no_grad(): dist = vae.encode(video).latent_dist.sample()
@@ -252,9 +252,10 @@ def main():
                     latent_chunks.append(latent)
 
                     # Ref Mask Chunk, Mask of shape [B, F, H, W, C]
-                    rm = batch["cond_chunks"]["ref_mask"][i]
-                    rm = rm.to(device=accelerator.device, dtype=weight_dtype).permute(0, 4, 1, 2, 3)
-                    ref_mask_chunks.append(rm) # now [B, C_mask, F, H, W]
+                    B, F, C, H, W = latent.shape
+                    rm = torch.zeros((B, F, 1, H, W), device=accelerator.device, dtype=weight_dtype)
+                    rm[:, 0] = 1.0
+                    ref_mask_chunks.append(rm)
 
                 # Sequence Info, Sequence of Bool suggesting which chunk is used as reference
                 # Here, all are not reference
@@ -263,7 +264,7 @@ def main():
                 # Sample Random Noise
                 B, F_z, C_z, H_z, W_z = latent_chunks[0].shape
                 timesteps = torch.randint(
-                    0,
+                    1,
                     scheduler.config.num_train_timesteps,
                     (B,),
                     device=accelerator.device
@@ -271,16 +272,19 @@ def main():
 
                 # Noise Latent
                 noised_latents = []
+                noises = []
                 for i, clean_latent in enumerate(latent_chunks):
-                    noise = torch.randn_like(clean_latent[:, :, 1:, :, :])
+                    noise = torch.randn_like(clean_latent)
                     z = clean_latent.clone()
-                    z[:, :, 1:, :, :] = scheduler.add_noise(clean_latent[:, :, 1:, :, :], noise, timesteps).to(weight_dtype)
+                    z = scheduler.add_noise(clean_latent, noise, timesteps).to(weight_dtype)
+                    z = ref_mask_chunks[i] * clean_latent + (1 - ref_mask_chunks[i]) * z
                     noised_latents.append(z)
+                    noises.append(noise)
 
                 # Trivial Audio, Text, and Condition
                 audio_embeds = torch.zeros((B, F_z, 768), dtype=weight_dtype, device=accelerator.device)
                 text_embeds  = torch.zeros((B, 1,
-                    transformer.config.attention_head_dim * transformer.config.num_attention_heads
+                    unwrap_model(transformer).config.attention_head_dim * unwrap_model(transformer).config.num_attention_heads
                 ), dtype=weight_dtype, device=accelerator.device)
                 B, F_z, C_z, H_z, W_z = noised_latents[0].shape
                 zero_cond = [torch.zeros((B, F_z, 1, H_z, W_z), dtype=weight_dtype, device=accelerator.device)] * len(noised_latents)
@@ -297,24 +301,26 @@ def main():
                     return_dict=False
                 )[0]
 
-                model_output = torch.cat(model_outputs, dim=1)
-                model_input = torch.cat(latent_chunks, dim=1)
-                noisy_input = torch.cat(noised_latents, dim=1)
+                total_loss = 0.0
 
-                # Compute Loss
-                model_pred = scheduler.get_velocity(model_output, noisy_input, timesteps)
-                alphas_cumprod = scheduler.alphas_cumprod[timesteps]
-                weights = 1 / (1 - alphas_cumprod)
-                while len(weights.shape) < len(model_pred.shape):
-                    weights = weights.unsqueeze(-1)
+                for clean_lat, noised, noise, pred_noise, ref_mask in zip(
+                    latent_chunks, noised_latents, noises, model_outputs, ref_mask_chunks
+                ):
+                    v_pred = scheduler.get_velocity(noised, pred_noise, timesteps)
+                    v_true = scheduler.get_velocity(clean_lat, noise, timesteps)
+
+                    alpha_bar = scheduler.alphas_cumprod[timesteps]
+                    weights = (1.0 / (1.0 - alpha_bar)).view(B, 1, 1, 1,1)
+                    non_ref = 1.0 - ref_mask
+                    weights = torch.where(non_ref > 0, weights, torch.zeros_like(weights))
+                    
+                    non_ref = 1.0 - ref_mask
+                    norm = non_ref.mean()
+
+                    _loss = weights * (v_pred - v_true).pow(2) * non_ref / norm
+                    total_loss += _loss.mean()
                 
-                target = model_input
-                loss = (weights * (model_pred - target) ** 2)
-                # loss = loss * non_ref_mask / non_ref_mask.mean() Commented Since all ref mask are set to 0
-                loss = torch.mean(loss.reshape(B, -1), dim=1)
-                loss = loss.mean()
-                accelerator.backward(loss)
-
+                loss = total_loss / len(latent_chunks)
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -340,7 +346,7 @@ def main():
 
                     accelerator.log({"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
 
-                    if global_step >= args._steps:
+                    if global_step >= args.max_train_steps:
                         break
 
 def get_args():
