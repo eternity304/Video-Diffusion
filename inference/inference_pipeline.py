@@ -92,14 +92,17 @@ class VideoDiffusionPipeline(DiffusionPipeline):
         sequence_infos: List[tuple] = []
         ref_latent_chunks: List[torch.Tensor] = []
 
+        # 4) timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, _ = retrieve_timesteps(self.scheduler, num_inference_steps, device=device)
+
         for i, video in enumerate(batch["video_chunks"]):
             # video: [B, C, F, H, W]
             video = video.to(device=device, dtype=dtype)
-            # Initialize first frame and set rest as random noise
-            video[:, :, 1:, :, :] = torch.randn(video[:, :, 1:, :, :].shape, generator=generator, device=device, dtype=dtype)
-            with torch.no_grad(): dist = self.vae.encode(video).latent_dist.sample()
-            latent = dist * self.vae.config.scaling_factor * self.scheduler.init_noise_sigma
-            latent = latent.permute(0, 2, 1, 3, 4).contiguous().to(dtype)  # [B, F, C_z, h, w]
+            B = video.shape[0]
+            dist = self.vae.encode(video).latent_dist.sample()
+            latent = dist * self.vae.config.scaling_factor 
+            latent = latent.permute(0,2,1,3,4).contiguous().to(dtype) # [B, F, C_z, h, w]
             latent_chunks.append(latent)
 
             # mask: batch["cond_chunks"]["ref_mask"][i] shape [B, F, H, W, C_mask]
@@ -114,20 +117,11 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             seq = torch.arange(0, latent.shape[1], device=device)
             sequence_infos.append((is_ref, seq))
 
-            # 2) Build 2× for classifier-free guidance
-            # latents = latent_chunks
-
-            # 4) timesteps
-            timesteps, _ = retrieve_timesteps(self.scheduler, num_inference_steps, device=device)
-
             init_latents = []
-            for i, x0 in enumerate(latent_chunks):
+            for idx, x0 in enumerate(latent_chunks):
                 # sample a fresh ε noise
                 noise = torch.randn_like(x0, dtype=dtype, device=device)
-                # diffuse *all* frames to T
                 zT = self.scheduler.add_noise(x0, noise, timesteps[0])
-                # mask the first frame to remain clean
-                zT = ref_mask_chunks[i] * x0 + (1 - ref_mask_chunks[i]) * zT
                 init_latents.append(zT)
             latents = init_latents
 
@@ -145,7 +139,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
 
             for i, t in enumerate(tqdm(timesteps, desc="Inference Progress")):
                 # 1) prep the model input
-                latent_in = [self.scheduler.scale_model_input(x, t_int).to(dtype) for x in latents]
+                latent_in = [self.scheduler.scale_model_input(x, t).to(dtype) for x in latents]
                 B = latent_in[0].shape[0]
                 
                 zero_cond = torch.zeros((latent_in[0].shape[0], F, 1, H, W), dtype=dtype, device=device)
