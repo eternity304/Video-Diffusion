@@ -98,7 +98,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             # Initialize first frame and set rest as random noise
             video[:, :, 1:, :, :] = torch.randn(video[:, :, 1:, :, :].shape, generator=generator, device=device, dtype=dtype)
             with torch.no_grad(): dist = self.vae.encode(video).latent_dist.sample()
-            latent = dist * self.vae.config.scaling_factor
+            latent = dist * self.vae.config.scaling_factor * self.scheduler.init_noise_sigma
             latent = latent.permute(0, 2, 1, 3, 4).contiguous().to(dtype)  # [B, F, C_z, h, w]
             latent_chunks.append(latent)
 
@@ -139,19 +139,11 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                 self.transformer.config.attention_head_dim * self.transformer.config.num_attention_heads
             ), dtype=dtype, device=device)
 
-            # 5) optional fuse QKV once
-            # try:
-            #     self.transformer.fuse_qkv_projections()
-            # except Exception:
-            #     pass
-
             # 6) denoising loop
             old_pred_original_samples = [None] * len(latents)
             extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
             for i, t in enumerate(tqdm(timesteps, desc="Inference Progress")):
-                t_int = int(t.item())    # or simply int(t)
-
                 # 1) prep the model input
                 latent_in = [self.scheduler.scale_model_input(x, t_int).to(dtype) for x in latents]
                 B = latent_in[0].shape[0]

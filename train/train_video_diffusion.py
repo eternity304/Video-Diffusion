@@ -273,13 +273,18 @@ def main():
                 ).long()
 
                 # Noise Latent
+                # noised_latents = []
+                # for i, video in enumerate(batch["video_chunks"]):
+                #     video = video.to(accelerator.device).to(weight_dtype)
+                #     noise = torch.randn_like(video)
+                #     noise[:, :, 0, :, :] = 0
+                #     video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise[:, :, 1:, :, :], timesteps).to(weight_dtype)
+                #     noised_latents.append(encode_video(vae, video))
                 noised_latents = []
-                for i, video in enumerate(batch["video_chunks"]):
-                    video = video.to(accelerator.device).to(weight_dtype)
-                    noise = torch.randn_like(video)
-                    noise[:, :, 0, :, :] = 0
-                    video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise[:, :, 1:, :, :], timesteps).to(weight_dtype)
-                    noised_latents.append(encode_video(vae, video))
+                for idx, latent in enumerate(latent_chunks):
+                    noise = torch.randn_like(latent, device=accelerator.device, dtype=weight_dtype)
+                    noisy_latent = scheduler.add_noise(latent, noise, timesteps)
+                    noised_latents.append(noisy_latent)
 
                 # Trivial Audio, Text, and Condition
                 audio_embeds = torch.zeros((B, F_z, 768), dtype=weight_dtype, device=accelerator.device)
