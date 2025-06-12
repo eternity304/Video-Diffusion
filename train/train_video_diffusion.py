@@ -1,7 +1,6 @@
 from data.VideoDataset import VideoDataset
 from model.cap_transformer import CAPVideoXTransformer3DModel
 from train.trainUtils import *
-from model.cogvideo_transformer import CustomCogVideoXTransformer3DModel
 
 from diffusers import AutoencoderKLCogVideoX, CogVideoXDDIMScheduler
 from diffusers.optimization import get_scheduler
@@ -93,7 +92,7 @@ def main():
         generator=g
     )
 
-    transformer = CustomCogVideoXTransformer3DModel.from_pretrained(
+    transformer = CAPVideoXTransformer3DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         low_cpu_mem_usage=False,
         device_map=None,
@@ -292,21 +291,19 @@ def main():
                 # Trivial Audio, Text, and Condition
                 audio_embeds = torch.zeros((B, F_z, 768), dtype=weight_dtype, device=accelerator.device)
                 text_embeds  = torch.zeros((B, 1,
-                #     unwrap_model(transformer).config.attention_head_dim * unwrap_model(transformer).config.num_attention_heads
-                # ), dtype=weight_dtype, device=accelerator.device)
-                    4096
+                    unwrap_model(transformer).config.attention_head_dim * unwrap_model(transformer).config.num_attention_heads
                 ), dtype=weight_dtype, device=accelerator.device)
                 B, F_z, C_z, H_z, W_z = noised_latents[0].shape
                 zero_cond = [torch.zeros((B, F_z, 1, H_z, W_z), dtype=weight_dtype, device=accelerator.device)] * len(noised_latents)
 
                 # Predict Noise
                 model_outputs = transformer(
-                    hidden_states=noised_latents[0],
-                    encoder_hidden_states=text_embeds[0],
-                    # audio_embeds=audio_embeds,
-                    # condition=zero_cond,
+                    hidden_states=noised_latents,
+                    encoder_hidden_states=text_embeds,
+                    audio_embeds=audio_embeds,
+                    condition=zero_cond,
                     timestep=timesteps,
-                    # sequence_infos=sequence_infos,
+                    sequence_infos=sequence_infos,
                     image_rotary_emb=None,
                     return_dict=False
                 )[0]

@@ -307,7 +307,6 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         attention_head_dim: int = 64,
         in_channels: int = 16,
         cond_in_channels: int = 0,
-        camera_cond_in_channels: int = 0,
         out_channels: Optional[int] = 16,
         flip_sin_to_cos: bool = True,
         freq_shift: int = 0,
@@ -363,7 +362,6 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
             temporal_interpolation_scale=temporal_interpolation_scale,
             use_positional_embeddings=not use_rotary_positional_embeddings,
             use_learned_positional_embeddings=use_learned_positional_embeddings,
-            camera_cond_in_channels=camera_cond_in_channels,
         )
         self.embedding_dropout = nn.Dropout(dropout)
 
@@ -526,7 +524,6 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         self,
         hidden_states: List[torch.Tensor],
         condition: List[torch.Tensor],
-        cam_condition: List[torch.Tensor],
         encoder_hidden_states: torch.Tensor,
         audio_embeds: torch.Tensor,
         timestep: Union[int, float, torch.LongTensor],
@@ -584,7 +581,6 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
             image_embeds=hidden_states, 
             image_conds=condition,
             sequence_infos=sequence_infos,
-            camera_pos_embeds=cam_condition,
         )
         hidden_states = self.embedding_dropout(hidden_states)
 
