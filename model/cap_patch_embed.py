@@ -486,6 +486,7 @@ class CAPPatchEmbed(nn.Module):
         temporal_interpolation_scale: float = 1.0,
         use_positional_embeddings: bool = True,
         use_learned_positional_embeddings: bool = True,
+        camera_cond_in_channels: int = 0,
     ) -> None:
         super().__init__()
 
@@ -502,6 +503,7 @@ class CAPPatchEmbed(nn.Module):
         self.temporal_interpolation_scale = temporal_interpolation_scale
         self.use_positional_embeddings = use_positional_embeddings
         self.use_learned_positional_embeddings = use_learned_positional_embeddings
+        self.use_camera_pos_enc = camera_cond_in_channels > 0
 
         assert patch_size_t is None
         if patch_size_t is None:
@@ -519,11 +521,12 @@ class CAPPatchEmbed(nn.Module):
 
         # self.text_proj = nn.Linear(text_embed_dim, embed_dim)
 
-        # self.audio_embed_proj = nn.Linear(2, embed_dim)
-        # self.audio_embed_proj.weight.data *= 0.
-        # self.audio_embed_proj.bias.data *= 0.
         self.audio_proj = nn.Linear(audio_embed_dim * self.temporal_compression_ratio, embed_dim)
-  
+
+        if self.use_camera_pos_enc:
+            self.camera_pos_proj = zero_module(nn.Conv2d(
+                camera_cond_in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+            ))
 
         self.ref_temp_proj = nn.Linear(2, embed_dim // 4)
 
@@ -603,6 +606,7 @@ class CAPPatchEmbed(nn.Module):
         image_embeds: List[torch.Tensor], 
         image_conds: List[torch.Tensor],
         sequence_infos: List[Tuple[bool, List[int]]],  # list of (is_ref: bool, frame_range: np.ndarray)
+        camera_pos_embeds: torch.Tensor = None,
     ):
         r"""
         Args:
@@ -613,12 +617,12 @@ class CAPPatchEmbed(nn.Module):
         """
 
         n_latents = len(sequence_infos[-1][1])
-        n_frames = (n_latents - 1) * self.temporal_compression_ratio + 1
+        # n_frames = (n_latents - 1) * self.temporal_compression_ratio + 1
         # reshape audio embeddings to fit number of frames
-        audio_embeds = F.interpolate(audio_embeds.permute(0, 2, 1)[..., None], (n_frames, 1), mode="bilinear", align_corners=False)
-        audio_embeds = audio_embeds[..., 0].permute(0, 2, 1) # B T C
-        audio_embeds = F.pad(audio_embeds, (0, 0, self.temporal_compression_ratio-1, 0), mode="constant", value=0.)
-        audio_embeds = einops.rearrange(audio_embeds, 'b (t s) c -> b t (s c)', s=self.temporal_compression_ratio)
+        # audio_embeds = F.interpolate(audio_embeds.permute(0, 2, 1)[..., None], (n_frames, 1), mode="bilinear", align_corners=False)
+        # audio_embeds = audio_embeds[..., 0].permute(0, 2, 1) # B T C
+        # audio_embeds = F.pad(audio_embeds, (0, 0, self.temporal_compression_ratio-1, 0), mode="constant", value=0.)
+        # audio_embeds = einops.rearrange(audio_embeds, 'b (t s) c -> b t (s c)', s=self.temporal_compression_ratio)
         audio_embeds = self.audio_proj(audio_embeds)
 
         # audio_pos_embeds = self.audio_embed_proj(self.audio_extra_embedding[None])
@@ -647,7 +651,10 @@ class CAPPatchEmbed(nn.Module):
 
             ref_id = 0
 
-            for img_embed, img_cond, seq_info in zip(image_embeds, image_conds, sequence_infos):
+            for seq_id, seq_info in enumerate(sequence_infos):
+                img_embed = image_embeds[seq_id]
+                img_cond = image_conds[seq_id]
+                # img_embed, img_cond, seq_info in zip(image_embeds, image_conds, sequence_infos):
 
                 batch_size, num_frames, channels, height, width = img_embed.shape
 
@@ -656,6 +663,13 @@ class CAPPatchEmbed(nn.Module):
                 img_cond = self.cond_proj(img_cond)
                 img_embed = self.proj(img_embed)
                 img_embed = img_embed + img_cond  ############
+
+                if self.use_camera_pos_enc:
+                    camera_cond = camera_pos_embeds[seq_id]
+                    camera_cond = camera_cond.reshape(-1, camera_cond.shape[2], height, width)
+                    camera_cond = self.camera_pos_proj(camera_cond)
+                    img_embed = img_embed + camera_cond
+
                 img_embed = img_embed.view(batch_size, num_frames, *img_embed.shape[1:])
 
                 if not seq_info[0]:
