@@ -12,6 +12,17 @@ from diffusers import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.video_processor import VideoProcessor
 
+import argparse
+import os
+import math
+import yaml
+import logging
+import random
+import numpy as np
+import sys
+import imageio
+import torch
+
 def save_video(video : torch.tensor, save_path : str, fps : int = 16):
     video_np = video.permute(1, 2, 3, 0).cpu().numpy()  # [49, 256, 256, 3]
 
@@ -269,7 +280,10 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             for latent in latents:
                 dec = latent.permute(0, 2, 1, 3, 4) / self.vae.config.scaling_factor
                 frames = self.vae.decode(dec).sample
+                frames = frames.permute(0, 2, 1, 3, 4)
                 video = self.video_processor.postprocess_video(video=frames, output_type=output_type)
                 videos.append(video)
 
             return {"frames": videos} if return_dict else videos
+        
+
