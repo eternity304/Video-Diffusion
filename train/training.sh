@@ -30,7 +30,7 @@ accelerate launch --config_file $CONFIG_PATH /scratch/ondemand28/harryscz/diffus
     --tracker-name "cogvideox" \
     --is-uncond false \
     --max-grad-norm 1.0 \
-    --checkpointing-steps 100 \
+    --checkpointing-steps 200 \
 
 
 

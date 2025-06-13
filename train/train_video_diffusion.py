@@ -2,11 +2,12 @@ from data.VideoDataset import VideoDataset
 from model.cap_transformer import CAPVideoXTransformer3DModel
 from train.trainUtils import *
 
-from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler
+from diffusers import AutoencoderKLCogVideoX, CogVideoXDDIMScheduler
 from diffusers.optimization import get_scheduler
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+import torch.nn.functional as F
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
@@ -114,9 +115,10 @@ def main():
         variant=args.variant,
         torch_dtype=torch.float32
     )
-    scheduler = CogVideoXDPMScheduler.from_pretrained(
+    scheduler = CogVideoXDDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
+        prediction_type="v_prediction"
     )
 
     if args.enable_slicing:
@@ -254,8 +256,8 @@ def main():
                     latent_chunks.append(latent)
 
                     # Ref Mask Chunk, Mask of shape [B, F, H, W, C]
-                    B, F, C, H, W = latent.shape
-                    rm = torch.zeros((B, F, 1, H, W), device=accelerator.device, dtype=weight_dtype)
+                    B, F_z, C, H, W = latent.shape
+                    rm = torch.zeros((B, F_z, 1, H, W), device=accelerator.device, dtype=weight_dtype)
                     rm[:, 0] = 1.0
                     ref_mask_chunks.append(rm)
 
@@ -273,13 +275,18 @@ def main():
                 ).long()
 
                 # Noise Latent
+                # noised_latents = []
+                # for i, video in enumerate(batch["video_chunks"]):
+                #     video = video.to(accelerator.device).to(weight_dtype)
+                #     noise = torch.randn_like(video)
+                #     noise[:, :, 0, :, :] = 0
+                #     video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise[:, :, 1:, :, :], timesteps).to(weight_dtype)
+                #     noised_latents.append(encode_video(vae, video))
                 noised_latents = []
-                for i, video in enumerate(batch["video_chunks"]):
-                    video = video.to(accelerator.device).to(weight_dtype)
-                    noise = torch.randn_like(video)
-                    noise[:, :, 0, :, :] = 0
-                    video[:, :, 1:, :, :] = scheduler.add_noise(video[:, :, 1:, :, :], noise[:, :, 1:, :, :], timesteps).to(weight_dtype)
-                    noised_latents.append(encode_video(vae, video))
+                for idx, latent in enumerate(latent_chunks):
+                    noise = torch.randn_like(latent, device=accelerator.device, dtype=weight_dtype)
+                    noisy_latent = scheduler.add_noise(latent, noise, timesteps)
+                    noised_latents.append(noisy_latent)
 
                 # Trivial Audio, Text, and Condition
                 audio_embeds = torch.zeros((B, F_z, 768), dtype=weight_dtype, device=accelerator.device)
@@ -311,16 +318,22 @@ def main():
                 # print("model_output", model_output.min(), model_output.max())
                 model_pred = scheduler.get_velocity(model_output, noisy_input, timesteps)
 
-                alphas_cumprod = scheduler.alphas_cumprod[timesteps]
-                weights = 1 / (1 - alphas_cumprod)
-                while len(weights.shape) < len(model_pred.shape):
-                    weights = weights.unsqueeze(-1)
+                alpha_bar = scheduler.alphas_cumprod[timesteps].to(weight_dtype)
+                sigma_bar = (1 - alpha_bar).sqrt()
+                eps = (model_input - alpha_bar.sqrt() * noisy_input) / sigma_bar
+                v_true = alpha_bar.sqrt() * eps - sigma_bar * model_input
+                loss = F.mse_loss(model_pred, v_true)
 
-                target = model_input
+                # alphas_cumprod = scheduler.alphas_cumprod[timesteps]
+                # weights = 1 / (1 - alphas_cumprod)
+                # while len(weights.shape) < len(model_pred.shape):
+                #     weights = weights.unsqueeze(-1)
 
-                loss = (weights * (model_pred - target) ** 2)
-                loss = torch.mean(loss.reshape(B, -1), dim=1)
-                loss = loss.mean()
+                # target = model_input
+
+                # loss = (weights * (model_pred - target) ** 2)
+                # loss = torch.mean(loss.reshape(B, -1), dim=1)
+                # loss = loss.mean()
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
