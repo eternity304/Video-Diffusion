@@ -179,96 +179,6 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                     new_latents.append(_z)
                 latents = list(new_latents)
 
-        # for i, t in enumerate(tqdm(timesteps, desc="Inference Progress")):
-        #     latent_model_inputs = [self.scheduler.scale_model_input(latent, t).to(dtype) for latent in latents]
-        #     latent_model_inputs = [torch.cat([chunks] * 2, dim=0)for chunks in latent_model_inputs]
-        #     B2, F, C, H, W = latent_model_inputs[0].shape
-        #     # one zero condition tensor
-        #     zero_cond = torch.zeros((B2, F, 1, H, W), dtype=dtype, device=device)
-        #     # single forward
-        #     raw_outputs = self.transformer(
-        #         hidden_states=latent_model_inputs,
-        #         encoder_hidden_states=text_embeds,
-        #         audio_embeds=audio_embeds,
-        #         condition=[zero_cond] * len(latent_model_inputs),
-        #         sequence_infos=[[False, torch.arange(chunk.shape[1])]for chunk in latents],
-        #         timestep=t.expand(B2),
-        #         image_rotary_emb=None,
-        #         return_dict=False,
-        #     )[0]
-
-        #     uncond, cond = noise_pred.chunk(2)
-        #     noise_pred   = uncond + guidance_scale * (cond - uncond)
-
-        #     new_latents = []
-        #     new_old_preds = []
-
-        #     # 3) for each chunk, invert velocity → noise, then step
-        #     for idx, raw in enumerate(noise_pred):
-        #         # split conditional vs. unconditional batch
-        #         raw_cond, raw_uncond = raw.chunk(2, dim=0)  # each is shape [B, C, H, W]
-
-        #         # 3a) compute v_pred for cond & uncond
-        #         v_cond   = self.scheduler.get_velocity(raw_cond,   latents[idx], t).to(dtype)
-        #         v_uncond = self.scheduler.get_velocity(raw_uncond, latents[idx], t).to(dtype)
-
-        #         # 3b) apply guidance in velocity domain
-        #         v_pred = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-        #         # 3c) convert v_pred → ε̂  via forward diffusion formula:
-        #         #    x_t = √ᾱ x₀ + √(1−ᾱ) ε  ⇒  ε = (x_t − √ᾱ x₀)/√(1−ᾱ)
-        #         alpha_bar = self.scheduler.alphas_cumprod[t]       # shape [B]
-        #         # reshape for broadcasting over [B, C, H, W] or [B,F,C,H,W]
-        #         # here we assume 5D [B,F,C,H,W], adjust dims as needed
-        #         while alpha_bar.ndim < v_pred.ndim:
-        #             alpha_bar = alpha_bar.unsqueeze(-1)
-        #         noise_pred = (latents[idx] - alpha_bar.sqrt() * v_pred) / (1 - alpha_bar).sqrt()
-
-        #         # 3d) step with the noise prediction
-        #         prev_sample, pred_original = self.scheduler.step(
-        #             noise_pred,
-        #             t,
-        #             latents[idx],
-        #             **extra_step_kwargs,
-        #             return_dict=False
-        #         )
-
-        #         # 4) re-apply your reference-frame masking
-        #         mixed = ref_mask_chunks[idx] * ref_latent_chunks[idx] \
-        #             + (1 - ref_mask_chunks[idx]) * prev_sample
-
-        #         new_latents.append(mixed)
-        #         new_old_preds.append(pred_original)
-
-        #     # 5) update for next iteration
-        #     latents = new_latents
-        #     old_pred_original_samples = new_old_preds                                           
-
-            # # apply guidance, scheduler.step, then mixing
-            # new_latents = []
-            # new_old_preds = []
-
-            # for idx, noise_pred in enumerate(noise_preds):
-            #     latent = latents[idx]
-            #     old_pred = old_pred_original_samples[idx]
-            #     noise_pred, noise_pred_uncond = noise_pred.chunk(2, dim=0)
-            #     # noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
-
-            #     prev_sample, pred_original_sample = self.scheduler.step(
-            #         model_output=noise_pred,
-            #         timestep=t,
-            #         sample=latent,
-            #         **extra_step_kwargs,
-            #         return_dict=False,
-            #     )
-            #     mixed = ref_mask_chunks[idx] * ref_latent_chunks[idx] + (1 - ref_mask_chunks[idx]) * prev_sample
-            #     new_latents.append(mixed)
-            #     new_old_preds.append(pred_original_sample)
-
-            # # update for next iteration
-            # latents = list(new_latents)
-            # old_pred_original_samples = new_old_preds
-
             # 7) decode to videos
             videos = []
             if return_latent:
@@ -280,7 +190,8 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             for latent in latents:
                 dec = latent.permute(0, 2, 1, 3, 4) / self.vae.config.scaling_factor
                 frames = self.vae.decode(dec).sample
-                frames = frames.permute(0, 2, 1, 3, 4)
+                # frames = frames.permute(0, 2, 1, 3, 4)
+                print(frames.shape)
                 video = self.video_processor.postprocess_video(video=frames, output_type=output_type)
                 videos.append(video)
 
