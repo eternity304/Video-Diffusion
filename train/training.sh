@@ -23,7 +23,7 @@ accelerate launch --config_file $CONFIG_PATH /scratch/ondemand28/harryscz/diffus
     --model-config $MODEL_CONFIG \
     --enable-tiling true \
     --enable-slicing true \
-    --num-train-epochs 1000 \
+    --num-train-epochs 3000 \
     --lr-scheduler "cosine" \
     --lr-warmup-steps 500 \
     --learning-rate 0.0001 \

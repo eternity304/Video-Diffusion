@@ -82,10 +82,10 @@ class VideoDiffusionPipeline(DiffusionPipeline):
         # Video post-processor
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-    def encode_video(self, vae, video):
+    def encode_video(self, video):
         with torch.no_grad():
-            dist = vae.encode(video).latent_dist.sample()
-        latent = dist * vae.config.scaling_factor
+            dist = self.vae.encode(video).latent_dist.sample()
+        latent = dist * self.vae.config.scaling_factor
         return latent.permute(0,2,1,3,4).contiguous()
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
@@ -147,7 +147,8 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             B = video.shape[0]
             latent = self.encode_video(video) * self.scheduler.init_noise_sigma
             latent_chunks.append(latent)
-            latents = latent_chunks
+            noise = torch.randn_like(latent_chunks[0], dtype=dtype, device=device)
+            latents = [self.scheduler.add_noise(item, noise, torch.tensor([999])) for item in latent_chunks]
 
             # mask: batch["cond_chunks"]["ref_mask"][i] shape [B, F, H, W, C_mask]
             B, F, _, H, W = latent.shape
@@ -173,11 +174,12 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             old_pred_original_samples = [None] * len(latents)
             extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+            print(timesteps)
             for i, t in enumerate(tqdm(timesteps, desc="Inference Progress")):
                 # 1) prep the model input
                 latent_in = [self.scheduler.scale_model_input(x, t).to(dtype) for x in latents]
                 B = latent_in[0].shape[0]
-                timestep = t.expand(latent_in.shape[0])
+                timestep = t.expand(latent_in[0].shape[0])
                 zero_cond = torch.zeros((B, F, 1, H, W), dtype=dtype, device=device)
 
                 # 2) predict noise
@@ -194,16 +196,14 @@ class VideoDiffusionPipeline(DiffusionPipeline):
 
                 _latents = []
                 _old_pred_original_samples = []
-                for idx, noise_pred, latents, old_pred_original_sample in enumerate(
-                    model_out, latent_in, old_pred_original_samples
+                for idx, item in enumerate(
+                    zip(model_out, latent_in, old_pred_original_samples)
                 ):
+                    noise_pred, latents, old_pred_original_sample = item
                     _z, old_pred_original_sample = self.scheduler.step(
-                        noise_pred,
-                        old_pred_original_sample,
-                        t,
-                        timesteps[i - 1] if i > 0 else None,
-                        latents,
-                        sample=latents[idx],
+                        model_output=noise_pred,
+                        sample=latents,
+                        timestep=t,
                         **extra_step_kwargs,
                         return_dict=False,
                     )
@@ -213,8 +213,8 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                 latents = list(_latents)
                 old_pred_original_samples = list(_old_pred_original_samples)
 
-                if i % 5 == 0:
-                    vid = self.decode_video[latents[0]]
+                if (i + 1)% 5 == 0:
+                    vid = self.decode_latents(latents[0])
                     plot_video(vid)
 
             # 7) decode to videos
@@ -226,10 +226,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                 return [self.decode_latents(lat) for lat in latents]
             
             for latent in latents:
-                dec = latent.permute(0, 2, 1, 3, 4) / self.vae.config.scaling_factor
-                frames = self.vae.decode(dec).sample
-                # frames = frames.permute(0, 2, 1, 3, 4)
-                print(frames.shape)
+                frames = self.decode_latents(latent)
                 video = self.video_processor.postprocess_video(video=frames, output_type=output_type)
                 videos.append(video)
 

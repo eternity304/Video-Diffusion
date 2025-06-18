@@ -495,7 +495,7 @@ class Flame():
         
         return sampledUV
 
-    def sampleTo3D(self, sampledUV, savePath=None):
+    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2):
         self.nFrames, nVerts, nChannel = sampledUV.shape 
 
         _sampledUV = sampledUV.clone()
@@ -512,7 +512,7 @@ class Flame():
 
         sampledSeq = sampledSeq * (gMax - gMin) + gMin 
                 
-        if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2)
+        if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2, dist=dist)
 
         return sampledSeq
 

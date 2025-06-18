@@ -75,7 +75,7 @@ def main():
     train_dataset = VideoDataset(
         videos_dir=args.dataset_path,
         num_ref_frames=1,
-        num_target_frames=49
+        num_target_frames=200
     )
     sampler = DistributedSampler(
         train_dataset,
@@ -118,7 +118,6 @@ def main():
     scheduler = CogVideoXDDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
-        prediction_type="v_prediction"
     )
 
     if args.enable_slicing:
@@ -301,8 +300,9 @@ def main():
                 # print("model_output", model_output.min(), model_output.max())
                 model_pred = scheduler.get_velocity(model_output, noisy_input, timesteps)
 
-                alphas_cumprod = scheduler.alphas_cumprod[timesteps].to(weight_dtype)
-                weights = 1 / (1 - alphas_cumprod)
+                alphas_cp = scheduler.alphas_cumprod[timesteps].to(weight_dtype)
+                eps       = 1e-6  # small epsilon to avoid zero
+                weights   = 1 / (torch.clamp(1 - alphas_cp, min=eps))
                 while len(weights.shape) < len(model_pred.shape):
                     weights = weights.unsqueeze(-1)
                 target = model_input
