@@ -75,8 +75,10 @@ def main():
     train_dataset = VideoDataset(
         videos_dir=args.dataset_path,
         num_ref_frames=1,
-        num_target_frames=200
+        num_target_frames=50,
+        read_all_frames=True
     )
+    print(train_dataset[0]['video_chunks'][0].shape)
     sampler = DistributedSampler(
         train_dataset,
         num_replicas=accelerator.num_processes,

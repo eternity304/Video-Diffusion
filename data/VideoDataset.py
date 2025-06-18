@@ -23,6 +23,7 @@ class VideoDataset(Dataset):
         num_target_frames: int,
         resize_hw: tuple = (256, 256),
         frame_rate: int = 16,
+        read_all_frames: bool = False
     ):
         """
         Args:
@@ -39,6 +40,7 @@ class VideoDataset(Dataset):
         self.total_frames = num_ref_frames + num_target_frames
         self.resize_hw = resize_hw
         self.frame_rate = frame_rate
+        self.read_all_frames = read_all_frames
 
         # List all video files in the directory
         exts = {".mp4", ".avi", ".mov", ".mkv"}
@@ -89,16 +91,24 @@ class VideoDataset(Dataset):
         N_total = video_frames.shape[0]
         F_req = self.total_frames
 
-        if N_total < F_req:
+        if N_total < F_req and not self.read_all_frames:
             # If the video is shorter than required frames, pad by repeating last frame:
             pad_amt = F_req - N_total
             last_frame = video_frames[-1:].repeat(pad_amt, 1, 1, 1)  # [pad_amt, H, W, 3]
             video_frames = torch.cat([video_frames, last_frame], dim=0)
             N_total = video_frames.shape[0]
+        if self.read_all_frames:
+            pad_amt = 0 
+            last_frame = video_frames[-1:].repeat(pad_amt, 1, 1, 1)  # [pad_amt, H, W, 3]
+            video_frames = torch.cat([video_frames, last_frame], dim=0)
+            N_total = video_frames.shape[0]
 
         # Randomly choose a starting index so that we have F_req consecutive frames
-        start_idx = random.randint(0, N_total - F_req)
-        clip = video_frames[start_idx : start_idx + F_req]  # [F_req, H_orig, W_orig, 3]
+        if self.read_all_frames:
+            clip = video_frames
+        else:
+            start_idx = random.randint(0, N_total - F_req)
+            clip = video_frames[start_idx : start_idx + F_req]  # [F_req, H_orig, W_orig, 3]
 
         # --------------------------------------------------------------------------------
         # 2. Resize & permute into shape [3, F_req, H, W]
