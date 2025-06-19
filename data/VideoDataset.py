@@ -1,158 +1,84 @@
 import os
-import random
 import torch
-import torchvision.transforms as T
+import random
 from torch.utils.data import Dataset
+from torchvision.transforms import Compose, Resize, CenterCrop
 from torchvision.io import read_video
 
 class VideoDataset(Dataset):
     """
-    Given a folder of video files, this Dataset returns for each index:
-      - video_chunks: [ [1, 3, F, H, W] ]       (a list of length 1)
-      - cond_chunks: {'ref_mask': [ [1, F, H, W] ]}
-      - chunk_is_ref: [ [True/False × F] ]
-      - raw_audio: None   (we’re not using audio)
-    
-    Here, F = num_ref_frames + num_target_frames.
-    The first num_ref_frames frames in each chunk are marked as reference.
+    Read each video in its entirety, resize, and return:
+      - video_chunks:   [ tensor([1, 3, N, H, W]) ]         (N = #frames after downsampling)
+      - cond_chunks:    {'ref_mask': [ tensor([1, N, H, W]) ]}
+      - chunk_is_ref:   [ tensor([bool] * N) ]
+      - raw_audio:      None
     """
     def __init__(
         self,
         videos_dir: str,
-        num_ref_frames: int,
-        num_target_frames: int,
+        num_ref_frames: int = 0,
         resize_hw: tuple = (256, 256),
-        frame_rate: int = 16,
-        read_all_frames: bool = False
+        frame_rate: int = None,
     ):
-        """
-        Args:
-          videos_dir: path to folder containing .mp4 (or .avi, etc.) files.
-          num_ref_frames: how many frames in each chunk to treat as reference (keep unnoised).
-          num_target_frames: how many frames in each chunk to actually train/denoise.
-          resize_hw: resize each frame to this (H, W) before stacking into tensors.
-          frame_rate: if you want to uniformly sample at this FPS; pass None to read all frames.
-        """
         super().__init__()
         self.videos_dir = videos_dir
         self.num_ref = num_ref_frames
-        self.num_target = num_target_frames
-        self.total_frames = num_ref_frames + num_target_frames
         self.resize_hw = resize_hw
-        self.frame_rate = frame_rate
-        self.read_all_frames = read_all_frames
+        self.frame_rate = frame_rate  # if None, keep *all* frames
 
-        # List all video files in the directory
         exts = {".mp4", ".avi", ".mov", ".mkv"}
         self.video_files = [
             os.path.join(videos_dir, f)
             for f in sorted(os.listdir(videos_dir))
             if os.path.splitext(f)[1].lower() in exts
         ]
-        if len(self.video_files) == 0:
-            raise ValueError(f"No video files found in {videos_dir}.")
+        if not self.video_files:
+            raise ValueError(f"No video files in {videos_dir!r}")
 
-        # Precompute a torchvision resize transform:
-        self.resize_transform = T.Compose([
-            T.Resize(resize_hw),       # resize shortest side to resize_hw[0], maintaining aspect, then center‐crop
-            T.CenterCrop(resize_hw),   # ensure final H×W
+        # resize shortest side to resize_hw[0], then center‐crop to (H, W)
+        self.resize_tf = Compose([
+            Resize(resize_hw), 
+            CenterCrop(resize_hw),
         ])
 
     def __len__(self):
         return len(self.video_files)
 
     def __getitem__(self, idx):
-        """
-        Returns a dict with keys:
-          - 'video_chunks':   [ tensor([1, 3, F, H, W]) ]
-          - 'cond_chunks':    {'ref_mask': [ tensor([1, F, H, W]) ] }
-          - 'chunk_is_ref':   [ tensor([True/False] * F) ]
-          - 'raw_audio':      None
-        """
-        video_path = self.video_files[idx]
+        path = self.video_files[idx]
 
-        # --------------------------------------------------------------------------------
-        # 1. Read the video (all frames). This returns:
-        #    video_frames: Tensor [N_frames_total, H_orig, W_orig, 3]
-        #    audio:        Tensor [num_audio_samples, channels] (unused here, so we ignore it)
-        #    info:         dict with metadata (fps, etc.)
-        # --------------------------------------------------------------------------------
-        if self.frame_rate is None:
-            video_frames, _, info = read_video(video_path, pts_unit="sec")
-        else:
-            # read_video doesn't let you directly downsample FPS, so read all then pick frames:
-            video_frames, _, info = read_video(video_path, pts_unit="sec")
-            # info['video_fps'] is the original FPS; we take every round‐off of fps/self.frame_rate
+        # 1) load & optionally downsample
+        video_frames, _, info = read_video(path, pts_unit="sec")
+        if self.frame_rate is not None:
             orig_fps = float(info.get("video_fps", 30.0))
-            skip_rate = max(1, round(orig_fps / float(self.frame_rate)))
-            video_frames = video_frames[::skip_rate]
+            skip = max(1, round(orig_fps / float(self.frame_rate)))
+            video_frames = video_frames[::skip]
 
-        # video_frames: shape [N_frames_total, H_orig, W_orig, 3], dtype=torch.uint8 (0–255)
-        N_total = video_frames.shape[0]
-        F_req = self.total_frames
+        # 2) normalize & resize each frame
+        processed = []
+        for frame in video_frames:               # [H, W, 3], uint8
+            f = frame.permute(2,0,1).float() / 255.0  # [3, H, W], float
+            f = self.resize_tf(f)                   # [3, H_out, W_out]
+            processed.append(f)
+        # stack → [N, 3, H, W] → permute → [3, N, H, W]
+        video = torch.stack(processed, dim=0).permute(1,0,2,3)
+        # add batch dim → [1, 3, N, H, W]
+        video = video.unsqueeze(0)
 
-        if N_total < F_req and not self.read_all_frames:
-            # If the video is shorter than required frames, pad by repeating last frame:
-            pad_amt = F_req - N_total
-            last_frame = video_frames[-1:].repeat(pad_amt, 1, 1, 1)  # [pad_amt, H, W, 3]
-            video_frames = torch.cat([video_frames, last_frame], dim=0)
-            N_total = video_frames.shape[0]
-        if self.read_all_frames:
-            pad_amt = 0 
-            last_frame = video_frames[-1:].repeat(pad_amt, 1, 1, 1)  # [pad_amt, H, W, 3]
-            video_frames = torch.cat([video_frames, last_frame], dim=0)
-            N_total = video_frames.shape[0]
+        _, _, N, H, W = video.shape
 
-        # Randomly choose a starting index so that we have F_req consecutive frames
-        if self.read_all_frames:
-            clip = video_frames
-        else:
-            start_idx = random.randint(0, N_total - F_req)
-            clip = video_frames[start_idx : start_idx + F_req]  # [F_req, H_orig, W_orig, 3]
+        # 3) build ref_mask over full length N
+        ref_mask = torch.zeros((1, N, H, W), dtype=torch.float32)
+        if self.num_ref > 0:
+            end = min(self.num_ref, N)
+            ref_mask[0, :end] = 1.0
 
-        # --------------------------------------------------------------------------------
-        # 2. Resize & permute into shape [3, F_req, H, W]
-        # --------------------------------------------------------------------------------
-        # clip is uint8 in [0,255]. First convert to float in [0,1], then normalize (0–1).
-        # torchvision transforms expect [C, H, W], so we do per‐frame transform in a loop:
-        frames_list = []
-        for f in range(F_req):
-            frame = clip[f]                           # [H_orig, W_orig, 3], uint8
-            frame = frame.permute(2, 0, 1).float() / 255.0   # [3, H_orig, W_orig], float
-            frame = self.resize_transform(frame)            # [3, H, W], still float
-            frames_list.append(frame)
+        # 4) chunk_is_ref boolean vector of length N
+        chunk_is_ref = torch.arange(N) < self.num_ref
 
-        # Stack into shape [F_req, 3, H, W], then permute to [3, F_req, H, W]
-        video_tensor = torch.stack(frames_list, dim=0).permute(1, 0, 2, 3)  # [3, F_req, H, W]
-
-        # Add a dummy batch‐dim so it becomes [1, 3, F_req, H, W]:
-        video_tensor = video_tensor.unsqueeze(0)
-
-        # --------------------------------------------------------------------------------
-        # 3. Build the “reference mask”: shape [1, F_req, H, W], float32 {0,1}.
-        #    First num_ref frames are reference → mask=1; rest mask=0.
-        # --------------------------------------------------------------------------------
-        ref_mask = torch.zeros((F_req, *self.resize_hw, 3), dtype=torch.float32)
-        ref_mask[: self.num_ref] = 1.0
-
-        # Add batch‐dim → [1, F_req, H, W]
-        ref_mask = ref_mask.unsqueeze(0)
-
-        # --------------------------------------------------------------------------------
-        # 4. Build chunk_is_ref: a length‐F_req boolean vector, True for reference frames
-        # --------------------------------------------------------------------------------
-        chunk_is_ref = torch.zeros(F_req, dtype=torch.bool)
-
-        # --------------------------------------------------------------------------------
-        # 5. Package into the format training loop expects:
-        #    - video_chunks:   a list of length 1, containing [1,3,F_req,H,W]
-        #    - cond_chunks:    {"ref_mask": [1, F_req, H, W]}
-        #    - chunk_is_ref:   a list of length 1, containing a [F_req] boolean tensor
-        #    - raw_audio:      None (we’re not using audio at all)
-        # --------------------------------------------------------------------------------
         return {
-            "video_chunks":       [video_tensor],          # list length=1
-            "cond_chunks":        {"ref_mask": [ref_mask]}, # list length=1 inside dict
-            "chunk_is_ref":       [chunk_is_ref],          # list length=1
-            "raw_audio":          None,
+            "video_chunks":    [video],            # list with [1,3,N,H,W]
+            "cond_chunks":     {"ref_mask": [ref_mask]},
+            "chunk_is_ref":    [chunk_is_ref],     # list with length-N bool tensor
+            "raw_audio":       None,
         }
