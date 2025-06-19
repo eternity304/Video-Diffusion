@@ -46,7 +46,7 @@ class VideoDataset(Dataset):
         exts = {".mp4", ".avi", ".mov", ".mkv"}
         self.video_files = [
             os.path.join(videos_dir, f)
-            for f in sorted(os.listdir(videos_dir)[:1])
+            for f in sorted(os.listdir(videos_dir))
             if os.path.splitext(f)[1].lower() in exts
         ]
         if len(self.video_files) == 0:
