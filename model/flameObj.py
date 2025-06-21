@@ -337,6 +337,38 @@ class Flame():
         # Save as a GIF with 30 frames per second:
         imageio.mimsave(savePath, frames, fps=30, quality=10) 
 
+    def renderAnimation(
+        self,
+        customVerts,
+        resolution=256,
+        dist=0.2
+    ):
+        self.nFrames, _, _ = customVerts.verts_padded().shape
+
+        R, T = look_at_view_transform(dist=dist, elev=0, azim=0)
+        cameras = PerspectiveCameras(
+            device=self.device, 
+            focal_length=self.focalLength[0, :].unsqueeze(0).expand(self.nFrames, 2),
+            principal_point=self.principalPoint[0, :].unsqueeze(0).expand(self.nFrames, 2),
+            R=R.expand(self.nFrames, 3, 3), T=T.expand(self.nFrames, 3),
+            in_ndc=False, image_size=((1096, 997),))
+
+        raster_settings = RasterizationSettings(
+            image_size=resolution,
+            blur_radius=0.0,
+            faces_per_pixel=1,
+        )
+
+        lights = PointLights(device=self.device, location=[[10.0, 10.0, 10.0]])
+
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
+            shader=SoftPhongShader(device=self.device, cameras=cameras, lights=lights)
+        )
+
+        images = renderer(customVerts)
+        return images
+
     def convertUV(self, uvPath="/scratch/ondemand28/harryscz/head_audio/head/head_template_mesh.obj", customSeq=None):
         # Load UV faces information
         verts, faces, aux = load_obj(uvPath)
@@ -412,18 +444,11 @@ class Flame():
         uvCameras = OrthographicCameras(
             device=self.device,
             R=torch.eye(3).unsqueeze(0),               # No rotation
-            T=torch.tensor([[-1.009,-1.02,5]], device=self.device)   # Camera at (0,0,5)
-        )
-
-        uvLights = DirectionalLights(
-            device=self.device,
-            direction=torch.tensor([[0.2, 0, 1]], dtype=torch.float32, device=self.device),
-            ambient_color=((0.5, 0.5, 0.5),),
-            specular_color=((1.0, 1.0, 1.0),)
+            T=torch.tensor([[-1.009,-1.02,5]], dtype=torch.float32, device=self.device)   # Camera at (0,0,5)
         )
 
         uvRasterSettings = RasterizationSettings(
-            image_size=256,
+            image_size=resolution,
             blur_radius=0.0,
             faces_per_pixel=1,
         )
@@ -439,7 +464,7 @@ class Flame():
                 blend_params=uvBlendParams
             )
         )
-        
+        # In your code:
         perFrameUV = uvRenderer(uvMesh)
         
         if fill:
@@ -453,6 +478,49 @@ class Flame():
 
         return smoothedPerFrameUV
     
+    def get_uv_animation(self, uvMesh, savePath=None):
+        verts_all  = uvMesh.verts_padded()           # [B, V, 3]
+        faces_all  = uvMesh.faces_padded()           # [B, F, 3]
+        feat_all   = uvMesh.textures.verts_features_padded()  # [B, V, C]
+
+        B = verts_all.shape[0]   # total number of frames
+        out = []
+        def render_chunk(start, end):
+            """Helper to build a sub‐Meshes and render it."""
+            chunk = Meshes(
+                verts=verts_all[start:end],
+                faces=faces_all[start:end],
+                textures=TexturesVertex(verts_features=feat_all[start:end])
+            )
+            return self.renderUV(chunk, savePath=None, fill=True, resolution=256)
+
+        try:
+            if B <= 491:
+                # one‐shot render
+                out.append(render_chunk(0, B))
+            else:
+                # first 491 frames
+                out.append(render_chunk(0, 491))
+                # remaining frames
+                out.append(render_chunk(491, B))
+        except RuntimeError as e:
+            # capture which chunk failed
+            print(f"→ Illegal memory access during frames {491}–{B}")
+            print(savePath)
+            print(e)
+            # you could decide to continue on the next chunk or break outright
+            # here we just stop and return whatever we've got so far
+            return torch.cat(out, dim=0) if out else None
+
+        out = torch.cat(out, dim=0)
+
+        if savePath is not None:
+            frames_rgb = (out[..., :3] * 255).byte().cpu().numpy()  
+            imageio.mimsave(savePath, frames_rgb, fps=30, quality=10) 
+            return out
+        else:
+            return out
+
     def sampleFromUV(self, perFrameUV, savePath=None, resolution=256):
         self.nFrames, W, H, C = perFrameUV.shape
 
@@ -510,10 +578,57 @@ class Flame():
         gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
         gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
 
-        sampledSeq = sampledSeq * (gMax - gMin) + gMin 
+        perFrameVerts = (sampledSeq * (gMax - gMin) + gMin) * 3
+
+        self.nFrames, _, _ = perFrameVerts.shape
+
+        perFrameFaces = self.faces.unsqueeze(0).expand(self.nFrames, self.faces.shape[0], 3)
+        perVertsTexture = torch.ones((self.nFrames, 5023, 3), dtype=torch.float32, device=self.device)
+
+        headMesh = Meshes(verts=perFrameVerts, faces=perFrameFaces)
+        headMesh.textures = TexturesVertex(verts_features=perVertsTexture)
                 
-        if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2, dist=dist)
+        # if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2, dist=dist)
+        verts_all  = headMesh.verts_padded()           # [B, V, 3]
+        faces_all  = headMesh.faces_padded()           # [B, F, 3]
+        feat_all   = headMesh.textures.verts_features_padded()  # [B, V, C]
 
-        return sampledSeq
+        B = verts_all.shape[0]   # total number of frames
+        out = []
 
+        def render_chunk(start, end):
+            """Helper to build a sub‐Meshes and render it."""
+            chunk = Meshes(
+                verts=verts_all[start:end],
+                faces=faces_all[start:end],
+                textures=TexturesVertex(verts_features=feat_all[start:end])
+            )
+            return self.renderAnimation(chunk)
+
+        try:
+            if B <= 491:
+                # one‐shot render
+                out.append(render_chunk(0, B))
+            else:
+                # first 491 frames
+                out.append(render_chunk(0, 491))
+                # remaining frames
+                out.append(render_chunk(491, B))
+        except RuntimeError as e:
+            # capture which chunk failed
+            print(f"→ Illegal memory access during frames {491}–{B}")
+            print(savePath)
+            print(e)
+            # you could decide to continue on the next chunk or break outright
+            # here we just stop and return whatever we've got so far
+            return torch.cat(out, dim=0) if out else None
+
+        out = torch.cat(out, dim=0)
+
+        if savePath is not None:
+            frames_rgb = (out[..., :3] * 255).byte().cpu().numpy()  
+            imageio.mimsave(savePath, frames_rgb, fps=30, quality=10) 
+            return out
+        else:
+            return out
 
