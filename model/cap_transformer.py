@@ -31,12 +31,72 @@ from diffusers.models.cache_utils import CacheMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
+from diffusers.models.normalization import CogVideoXLayerNormZero
 
 from model.cap_patch_embed import CAPPatchEmbed
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+class AdaLayerNorm(nn.Module):
+    r"""
+    Norm layer modified to incorporate timestep embeddings.
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`, *optional*): The size of the embeddings dictionary.
+        output_dim (`int`, *optional*):
+        norm_elementwise_affine (`bool`, defaults to `False):
+        norm_eps (`bool`, defaults to `False`):
+        chunk_dim (`int`, defaults to `0`):
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: Optional[int] = None,
+        output_dim: Optional[int] = None,
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        chunk_dim: int = 0,
+        dtype=torch.float32
+    ):
+        super().__init__()
+
+        self.chunk_dim = chunk_dim
+        output_dim = output_dim or embedding_dim * 2
+
+        if num_embeddings is not None:
+            self.emb = nn.Embedding(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, output_dim)
+        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine, dtype=dtype)
+
+    def forward(
+        self, x: torch.Tensor, timestep: Optional[torch.Tensor] = None, temb: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if self.emb is not None:
+            temb = self.emb(timestep)
+
+        temb = self.linear(self.silu(temb))
+
+        if self.chunk_dim == 1:
+            # This is a bit weird why we have the order of "shift, scale" here and "scale, shift" in the
+            # other if-branch. This branch is specific to CogVideoX and OmniGen for now.
+            shift, scale = temb.chunk(2, dim=1)
+            shift = shift[:, None, :]
+            scale = scale[:, None, :]
+        else:
+            scale, shift = temb.chunk(2, dim=0)
+        
+        scale = scale.to(dtype=x.dtype)
+        shift = shift.to(dtype=x.dtype)
+
+        x = self.norm(x) * (1 + scale) + shift
+        return x
 
 
 class CapVideoAttnProcessor2_0:
@@ -562,6 +622,10 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         # exit()
         t_emb = t_emb.to(dtype=hidden_states[-1].dtype)
         emb = self.time_embedding(t_emb, timestep_cond)
+
+        if emb.dtype == torch.float64:
+            emb = emb.float()
+
 
         if self.ofs_embedding is not None:
             ofs_emb = self.ofs_proj(ofs)
