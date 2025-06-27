@@ -671,7 +671,10 @@ class CAPPatchEmbed(nn.Module):
 
                     ref_id += 1
                 else:
-                    pos_embed = self.pos_embedding[None, seq_info[1] + seq_offset]
+                    idx = seq_info[1] + seq_offset
+                    idx = idx.tolist()
+
+                    pos_embed = self.pos_embedding[None, idx]
                 
                 # sub sample spatial positional embedding
                 if subsample_stride is not None:
