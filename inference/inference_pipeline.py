@@ -120,6 +120,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
         guidance_scale: float = 1.0,
         seed: int = 42,
         eta : float = 0.0,
+        sample_frames: int = 50,
         output_type: str = "pil",
         return_dict: bool = False,
         return_latent: bool = False,
@@ -127,6 +128,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
         return_decode_latent : bool = True,
     ) -> Union[List, Dict]:
         device = self._execution_device
+        device = self.transformer.device
         dtype = self.transformer.dtype
         generator = torch.Generator(device=device)
         generator.manual_seed(seed+1)
@@ -145,6 +147,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
             # video: [B, C, F, H, W]
             video = video.to(device=device, dtype=dtype)
             B = video.shape[0]
+            if video.shape[2] > sample_frames: video = video[:,:,:sample_frames,...]             
             latent = self.encode_video(video) * self.scheduler.init_noise_sigma
             latent_chunks.append(latent)
             noise = torch.randn_like(latent_chunks[0], dtype=dtype, device=device)
@@ -159,8 +162,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
 
             # sequence info
             is_ref = batch.get("chunk_is_ref", [False] * len(latent_chunks))[i]
-            seq = torch.arange(0, latent.shape[1], device=device)
-            sequence_infos.append((is_ref, seq))
+            sequence_infos = [[False, torch.arange(chunk.shape[1], device=device)]for chunk in latent_chunks]
 
             # 3) dummy audio/text embeddings (adjust if you have real ones)
             B2 = latent_chunks[0].shape[0] 
@@ -188,7 +190,7 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                     encoder_hidden_states=text_embeds,
                     audio_embeds=audio_embeds,
                     condition=[zero_cond] * len(latent_in),
-                    sequence_infos=[[False, torch.arange(chunk.shape[1])]for chunk in latents],
+                    sequence_infos=[[False, torch.arange(chunk.shape[1], device=device)]for chunk in latents],
                     timestep=timestep,
                     image_rotary_emb=None,
                     return_dict=False,
