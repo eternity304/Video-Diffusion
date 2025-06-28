@@ -82,3 +82,44 @@ class VideoDataset(Dataset):
             "chunk_is_ref":    [chunk_is_ref],     # list with length-N bool tensor
             "raw_audio":       None,
         }
+    
+def video_collate(batch):
+    # 1) find max frame‐length N in this batch
+    max_N = max(sample["video_chunks"][0].shape[2] for sample in batch)
+
+    videos = []
+    masks  = []
+
+    for sample in batch:
+        # unwrap and squeeze off the batch‐dim
+        vid = sample["video_chunks"][0].squeeze(0)    # [3, N_i, H, W]
+        N_i = vid.shape[1]
+
+        # pad to max_N along the frame axis
+        pad = torch.zeros(
+            (vid.shape[0], max_N - N_i, *vid.shape[2:]),
+            dtype=vid.dtype,
+            device=vid.device
+        )
+        vid_padded = torch.cat([vid, pad], dim=1)     # [3, max_N, H, W]
+        videos.append(vid_padded)
+
+        # mask: 1 for real frames, 0 for padded
+        mask = torch.cat([
+            torch.ones(N_i,  device=vid.device),
+            torch.zeros(max_N - N_i, device=vid.device)
+        ])
+        masks.append(mask)
+
+    # stack into batch dims
+    batched_videos = torch.stack(videos, dim=0)   # [B, 3, max_N, H, W]
+    batched_masks  = torch.stack(masks,  dim=0)   # [B, max_N]
+    if len(batched_videos.shape) == 4:
+        batched_videos = batched_videos.unsqueeze(0)   # [B, 3, max_N, H, W]
+        batched_masks  = batched_masks.unsqueeze(0)
+
+    return {
+        "video_chunks": batched_videos,
+        "mask":  batched_masks,
+        # you can also collate cond_chunks/chunk_is_ref here if needed...
+    }
