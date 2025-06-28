@@ -203,9 +203,16 @@ class VideoDiffusionPipeline(DiffusionPipeline):
                 ):
                     noise_pred, latents, old_pred_original_sample = item
                     _z, old_pred_original_sample = self.scheduler.step(
-                        model_output=noise_pred,
-                        sample=latents,
-                        timestep=t,
+                        # model_output=noise_pred,
+                        # sample=latents,
+                        # timestep=t,
+                        # **extra_step_kwargs,
+                        # return_dict=False,
+                        noise_pred,
+                        old_pred_original_sample,
+                        t,
+                        timesteps[i - 1] if i > 0 else None,
+                        latent,
                         **extra_step_kwargs,
                         return_dict=False,
                     )
