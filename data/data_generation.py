@@ -10,7 +10,7 @@ import os
 from tqdm import tqdm
 
 device = "cuda"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 flamePath = flamePath = "/scratch/ondemand28/harryscz/head_audio/head/code/flame/flame2023_no_jaw.npz"
 sourcePath = "/scratch/ondemand28/harryscz/head_audio/head/data/vfhq-fit"
@@ -35,12 +35,12 @@ for bad in bad_path:
 
 for path in tqdm(dataPath):
     try:
-        save_path = f"/scratch/ondemand28/harryscz/head_audio/data/data256/uv/{path.split('/')[-2]}.mp4"
+        save_path = f"/scratch/ondemand28/harryscz/head_audio/data/data512/uv/{path.split('/')[-2]}.mp4"
         if os.path.isfile(save_path): continue
         head.loadSequence(path)
         head.LSB()
         uvMesh = head.convertUV()
-        head.get_uv_animation(uvMesh, savePath=save_path)
+        head.get_uv_animation(uvMesh, savePath=save_path, resolution=512)
     except Exception as e:
         print(f"[ERROR] Failed on path: {path}\nReason: {e}")
         break
