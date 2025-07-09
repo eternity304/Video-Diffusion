@@ -280,7 +280,7 @@ class Flame():
 
         return perFrameVerts
 
-    def renderAnimation(
+    def renderVertsAnimation(
         self,
         savePath,
         vertsTexture = False,
@@ -341,17 +341,20 @@ class Flame():
         self,
         customVerts,
         resolution=256,
-        dist=0.2
+        dist=0.2,
+        elev=0.,
+        azim=0.
     ):
         self.nFrames, _, _ = customVerts.verts_padded().shape
+        centers = customVerts.verts_padded().mean(dim=1)
 
-        R, T = look_at_view_transform(dist=dist, elev=0, azim=0)
+        R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim, at=centers, device=self.device)
         cameras = PerspectiveCameras(
             device=self.device, 
             focal_length=self.focalLength[0, :].unsqueeze(0).expand(self.nFrames, 2),
             principal_point=self.principalPoint[0, :].unsqueeze(0).expand(self.nFrames, 2),
             R=R.expand(self.nFrames, 3, 3), T=T.expand(self.nFrames, 3),
-            in_ndc=False, image_size=((1096, 997),))
+            in_ndc=False, image_size=((1080, 1080),))
 
         raster_settings = RasterizationSettings(
             image_size=resolution,
@@ -478,12 +481,19 @@ class Flame():
 
         return smoothedPerFrameUV
     
-    def get_uv_animation(self, uvMesh, savePath=None):
+    def get_uv_animation(self, uvMesh, savePath=None, resolution=256, sample_frames=50):
         verts_all  = uvMesh.verts_padded()           # [B, V, 3]
         faces_all  = uvMesh.faces_padded()           # [B, F, 3]
         feat_all   = uvMesh.textures.verts_features_padded()  # [B, V, C]
 
         B = verts_all.shape[0]   # total number of frames
+
+        if B > sample_frames:
+            verts_all = verts_all[:sample_frames, ...]
+            faces_all = faces_all[:sample_frames, ...]
+            feat_all = feat_all[:sample_frames, ...]
+            B = sample_frames
+
         out = []
         def render_chunk(start, end):
             """Helper to build a sub‐Meshes and render it."""
@@ -492,7 +502,7 @@ class Flame():
                 faces=faces_all[start:end],
                 textures=TexturesVertex(verts_features=feat_all[start:end])
             )
-            return self.renderUV(chunk, savePath=None, fill=True, resolution=256)
+            return self.renderUV(chunk, savePath=None, fill=True, resolution=resolution)
 
         try:
             if B <= 491:
@@ -563,7 +573,7 @@ class Flame():
         
         return sampledUV
 
-    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2):
+    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2, elev=0., azim=0., scale=1, resolution=256):
         self.nFrames, nVerts, nChannel = sampledUV.shape 
 
         _sampledUV = sampledUV.clone()
@@ -589,31 +599,31 @@ class Flame():
         headMesh.textures = TexturesVertex(verts_features=perVertsTexture)
                 
         # if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2, dist=dist)
-        verts_all  = headMesh.verts_padded()           # [B, V, 3]
-        faces_all  = headMesh.faces_padded()           # [B, F, 3]
+        verts_all  = headMesh.verts_padded() * scale            # [B, V, 3]
+        faces_all  = headMesh.faces_padded()                    # [B, F, 3]
         feat_all   = headMesh.textures.verts_features_padded()  # [B, V, C]
 
         B = verts_all.shape[0]   # total number of frames
         out = []
 
-        def render_chunk(start, end):
+        def render_chunk(start, end, dist=dist):
             """Helper to build a sub‐Meshes and render it."""
             chunk = Meshes(
                 verts=verts_all[start:end],
                 faces=faces_all[start:end],
                 textures=TexturesVertex(verts_features=feat_all[start:end])
             )
-            return self.renderAnimation(chunk)
+            return self.renderAnimation(chunk, dist=dist, elev=elev, azim=azim, resolution=resolution)
 
         try:
             if B <= 491:
                 # one‐shot render
-                out.append(render_chunk(0, B))
+                out.append(render_chunk(0, B, dist=dist))
             else:
                 # first 491 frames
-                out.append(render_chunk(0, 491))
+                out.append(render_chunk(0, 491, dist=dist))
                 # remaining frames
-                out.append(render_chunk(491, B))
+                out.append(render_chunk(491, B, dist=dist))
         except RuntimeError as e:
             # capture which chunk failed
             print(f"→ Illegal memory access during frames {491}–{B}")
@@ -631,4 +641,14 @@ class Flame():
             return out
         else:
             return out
+        
+    def batch_uv(self, paths, resolution=256, sample_frames=50):
+        out = []
+        for path in paths:
+            self.loadSequence(path)
+            self.LSB()                                           
+            uvMesh = self.convertUV()                                            
+            uv = self.get_uv_animation(uvMesh, resolution=resolution, sample_frames=sample_frames) 
+            out.append(uv[..., :3].unsqueeze(0))
+        return torch.concat(out, dim=0)
 
