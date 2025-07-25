@@ -8,3 +8,4 @@ modelWeights/
 modelOut/
 flameOut/
 diffOut/
+.cache/
