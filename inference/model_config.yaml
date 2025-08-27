@@ -1,9 +1,9 @@
 use_audio: False
 height: 256
-width: 256
+width:  256
 max_num_frames: 100
 use_growth_scaling: True
 disable_conditioning: False
-max_n_references: 4
+max_n_references: 1
 num_reference: 1
 num_target: 49

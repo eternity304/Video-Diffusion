@@ -13,7 +13,7 @@ class VideoPathDataset(Dataset):
     ):
         super().__init__()
         self.source_dir = source_dir
-        self.dataPath = [os.path.join(os.path.join(source_dir, data), "fit.npz") for data in os.listdir(source_dir)]
+        self.dataPath = [os.path.join(os.path.join(source_dir, data), "fit.npz") for data in os.listdir(source_dir)][:1]
 
     def __len__(self):
         return len(self.dataPath)

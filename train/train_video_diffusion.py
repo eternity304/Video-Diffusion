@@ -1,4 +1,4 @@
-from data.VideoDataset import VideoDataset
+from data.VideoDataset import VideoDataset, DummyVideoDataset
 from model.cap_transformer import CAPVideoXTransformer3DModel
 from train.trainUtils import *
 
@@ -74,16 +74,14 @@ def main():
 
     train_dataset = VideoDataset(
         videos_dir=args.dataset_path,
-        num_ref_frames=1,
-        num_target_frames=50,
-        read_all_frames=True
     )
-    print(train_dataset[0]['video_chunks'][0].shape)
+    print(f"Training on {len(train_dataset)} videos")
     sampler = DistributedSampler(
         train_dataset,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
-        shuffle=True
+        shuffle=True,
+        seed=args.seed
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -104,11 +102,16 @@ def main():
         cond_in_channels=1,  # only one channel (the ref_mask)
         sample_width=model_config_yaml["width"] // 8,
         sample_height=model_config_yaml["height"] // 8,
+        sample_frames=args.sample_frames,
         max_text_seq_length=1,
         max_n_references=model_config_yaml["max_n_references"],
         apply_attention_scaling=model_config_yaml["use_growth_scaling"],
         use_rotary_positional_embeddings=False,
     )
+    
+    if args.ckpt_path != "":
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        transformer.load_state_dict(ckpt["state_dict"], strict=False)
 
     vae = AutoencoderKLCogVideoX.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -200,7 +203,13 @@ def main():
             power=args.lr_power,
         )
 
-    transformer, optimizer, lr_scheduler, train_dataloader = accelerator.prepare(transformer, optimizer, lr_scheduler, train_dataloader)
+    dummy_ds = DummyVideoDataset(length=10, num_frames=3, resize_hw=(32,32), num_ref=4)
+    dl       = DataLoader(dummy_ds, batch_size=8, shuffle=True)
+
+    transformer,  optimizer, lr_scheduler, dl = accelerator.prepare(
+        transformer, optimizer, lr_scheduler, dl
+    )
+
     if accelerator.is_main_process:
         tracker_name = args.tracker_name or "video-diffusion"
         accelerator.init_trackers(tracker_name, config={"dropout": 0.0, "learning_rate": args.learning_rate})
@@ -246,7 +255,8 @@ def main():
 
                 # Initialize necessary data for diffusion
                 for i, video in enumerate(batch["video_chunks"]):
-                    video = video.to(accelerator.device).to(weight_dtype)                
+                    video = video.to(device=accelerator.device, dtype=weight_dtype)
+                    if video.shape[2] > args.sample_frames: video = video[:,:,:args.sample_frames,...]             
                     # Encode Video
                     latent = encode_video(vae, video) # [B, F, C_z, H, W]
                     latent_chunks.append(latent)
@@ -257,14 +267,13 @@ def main():
                     rm[:, 0] = 1.0
                     ref_mask_chunks.append(rm)
 
-                sequence_infos = [[False, torch.arange(chunk.shape[1])]for chunk in latent_chunks]
+                sequence_infos = [[False, torch.arange(chunk.shape[1], device=accelerator.device)]for chunk in latent_chunks]
                 
                 # Sample Random Noise
                 B, F_z, C_z, H_z, W_z = latent_chunks[0].shape
                 timesteps = torch.randint(
                     0,
                     scheduler.config.num_train_timesteps,
-                    # scheduler.config.num_train_timesteps,
                     (B,),
                     device=accelerator.device
                 ).long()
@@ -304,7 +313,8 @@ def main():
 
                 alphas_cp = scheduler.alphas_cumprod[timesteps].to(weight_dtype)
                 eps       = 1e-6  # small epsilon to avoid zero
-                weights   = 1 / (torch.clamp(1 - alphas_cp, min=eps))
+                # weights   = 1 / (torch.clamp(1 - alphas_cp, min=eps))
+                weights   = 1 / (1 - alphas_cp)
                 while len(weights.shape) < len(model_pred.shape):
                     weights = weights.unsqueeze(-1)
                 target = model_input
@@ -367,7 +377,8 @@ def get_args():
     parser.add_argument("--max-grad-norm", type=float, default=1.0, required=True)
     parser.add_argument("--checkpointing-steps", type=int, default=500, required=True)
     parser.add_argument("--is-uncond", type=bool, default=False, required=True)
-
+    parser.add_argument("--sample-frames", type=int, default=49)
+    parser.add_argument("--ckpt-path", type=str, default="")
 
     return parser.parse_args()
 

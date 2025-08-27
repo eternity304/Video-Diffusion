@@ -108,6 +108,9 @@ def transform_vertices(
     transformed_verts = transformed_verts + transform[:, :3, [3]]
     return transformed_verts.permute(0, 2, 1)
 
+def is_invalid(t):
+    return t is None or not torch.is_tensor(t) or torch.isnan(t).any() or t.numel() != 2
+
 OPENCV2PYTORCH3D = torch.eye(4)
 OPENCV2PYTORCH3D[1, 1] = -1
 OPENCV2PYTORCH3D[2, 2] = -1
@@ -252,13 +255,15 @@ class Flame():
         vertsRotated = torch.einsum('b N i j, b N j -> b N i', weightedTransforms, vertsHomo)[..., :3] # (B, 3N, 3)
         return vertsRotated
 
-    def LSB(self, rotation=True):
+    def LSB(self, rotation=True, identity=False):
         '''
         This implementation use identity rotation
         '''
 
         # shapeOffset = self.blendShape()
         exprOffset = self.blendExpr()
+        if identity:
+            exprOffset *= 0.
         # perFrameVerts = self.verts.unsqueeze(0).expand(self.nFrames, 5023, 3).view(self.nFrames, -1) + shapeOffset + exprOffset
         perFrameVerts = self.verts.unsqueeze(0).expand(self.nFrames, 5023, 3).view(self.nFrames, -1) + exprOffset.view(self.nFrames, -1)
         rotatedPerFrameVerts = self.identityRotation(perFrameVerts)
@@ -343,10 +348,17 @@ class Flame():
         resolution=256,
         dist=0.2,
         elev=0.,
-        azim=0.
+        azim=0.,
+        image_size = 1080,
     ):
         self.nFrames, _, _ = customVerts.verts_padded().shape
         centers = customVerts.verts_padded().mean(dim=1)
+
+        if is_invalid(getattr(self, "focalLength", None)):
+            self.focalLength = torch.tensor([1700.0, 1700.0]).unsqueeze(0).to(self.device)
+
+        if is_invalid(getattr(self, "principalPoint", None)):
+            self.principalPoint = torch.tensor([image_size / 2, image_size / 2]).unsqueeze(0).to(self.device)
 
         R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim, at=centers, device=self.device)
         cameras = PerspectiveCameras(
@@ -354,7 +366,7 @@ class Flame():
             focal_length=self.focalLength[0, :].unsqueeze(0).expand(self.nFrames, 2),
             principal_point=self.principalPoint[0, :].unsqueeze(0).expand(self.nFrames, 2),
             R=R.expand(self.nFrames, 3, 3), T=T.expand(self.nFrames, 3),
-            in_ndc=False, image_size=((1080, 1080),))
+            in_ndc=False, image_size=((image_size, image_size),))
 
         raster_settings = RasterizationSettings(
             image_size=resolution,
@@ -372,7 +384,7 @@ class Flame():
         images = renderer(customVerts)
         return images
 
-    def convertUV(self, uvPath="/scratch/ondemand28/harryscz/head_audio/head/head_template_mesh.obj", customSeq=None):
+    def convertUV(self, uvPath="/scratch/ondemand28/harryscz/head_audio/head/head_template_mesh.obj", customSeq=None, rotation=True):
         # Load UV faces information
         verts, faces, aux = load_obj(uvPath)
 
@@ -390,8 +402,13 @@ class Flame():
         else: seq = self.seq
         # seq = self.scaleIsotropic(seq)
         self.nFrames, _, _ = seq.shape
-        gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
-        gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
+
+        if rotation:
+            gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
+            gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
+        else:
+            gMin = torch.tensor([-0.1124, -0.1944, -0.1546], dtype=torch.float32).to(self.device)
+            gMax = torch.tensor([0.1093, 0.1337, 0.0895], dtype=torch.float32).to(self.device)
 
         _seq = (seq - gMin) / (gMax - gMin)
 
@@ -481,7 +498,7 @@ class Flame():
 
         return smoothedPerFrameUV
     
-    def get_uv_animation(self, uvMesh, savePath=None, resolution=256, sample_frames=50):
+    def get_uv_animation(self, uvMesh, savePath=None, resolution=256, sample_frames=50, fill=True):
         verts_all  = uvMesh.verts_padded()           # [B, V, 3]
         faces_all  = uvMesh.faces_padded()           # [B, F, 3]
         feat_all   = uvMesh.textures.verts_features_padded()  # [B, V, C]
@@ -502,7 +519,7 @@ class Flame():
                 faces=faces_all[start:end],
                 textures=TexturesVertex(verts_features=feat_all[start:end])
             )
-            return self.renderUV(chunk, savePath=None, fill=True, resolution=resolution)
+            return self.renderUV(chunk, savePath=None, fill=fill, resolution=resolution)
 
         try:
             if B <= 491:
@@ -531,7 +548,7 @@ class Flame():
         else:
             return out
 
-    def sampleFromUV(self, perFrameUV, savePath=None, resolution=256):
+    def sampleFromUV(self, perFrameUV, savePath=None, resolution=256, returnMesh=False, fill=True):
         self.nFrames, W, H, C = perFrameUV.shape
 
         vertsUV3d = torch.stack([self.vertsUV[:, 0], self.vertsUV[:, 1], torch.ones(self.vertsUV.shape[0]).to(self.device)], dim=1) * 2.025
@@ -544,9 +561,9 @@ class Flame():
         grid = grid.clamp(epsilon, 1.0 - epsilon)
 
         # x = 2*u - 1  maps [0,1]->[-1,+1]
-        grid[..., 0] = 1.0 - 2.0 * grid[..., 0] + 0.0005
+        grid[..., 0] = (1.0 - 2.0 * grid[..., 0] + 0.0005 - 0.001 ) * 1.05
         # y = 1 - 2*v  flips the v axis, if needed
-        grid[..., 1] = 1.0 - 2.0 * grid[..., 1] - 0.025
+        grid[..., 1] = 1.0 - 2.0 * grid[..., 1] - 0.025 + 0.0215
 
         # grid[...,0] =  grid[..., 0]*2 - 1     # not 1 - 2*u
         # grid[...,1] =  1 - grid[..., 1]*2     # if you need a v-flip
@@ -569,11 +586,12 @@ class Flame():
         
         sampledUVMesh = Meshes(verts=self.vertsUV3d, faces=self.facesUV3d, textures=TexturesVertex(verts_features=sampledUV))
 
-        if savePath is not None: self.renderUV(sampledUVMesh, savePath=savePath, fill=False, resolution=resolution)
-        
-        return sampledUV
+        if savePath is not None: self.get_uv_animation(sampledUVMesh, savePath=savePath, resolution=resolution, fill=fill)
 
-    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2, elev=0., azim=0., scale=1, resolution=256):
+        return sampledUV
+    
+
+    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2, elev=0., azim=0., scale=1, resolution=256, rotation=True):
         self.nFrames, nVerts, nChannel = sampledUV.shape 
 
         _sampledUV = sampledUV.clone()
@@ -585,6 +603,7 @@ class Flame():
         sampledSeq = torch.zeros(self.nFrames, 5023, 3).to(self.device)
         sampledSeq[:, self.faces3d.view(-1),:] = faces3dFromUV[:, :, :]
 
+    
         gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
         gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
 
@@ -638,17 +657,84 @@ class Flame():
         if savePath is not None:
             frames_rgb = (out[..., :3] * 255).byte().cpu().numpy()  
             imageio.mimsave(savePath, frames_rgb, fps=30, quality=10) 
-            return out
+            return perFrameVerts
         else:
-            return out
+            return perFrameVerts
         
-    def batch_uv(self, paths, resolution=256, sample_frames=50):
+    def get_3d_animation(self, perFrameVerts, savePath, perVertsTexture=None, resolution=256, dist=0.1, elev=0.0, azim=0.0, scale=1):
+
+        self.nFrames, _, _ = perFrameVerts.shape
+
+        perFrameFaces = self.faces.unsqueeze(0).expand(self.nFrames, self.faces.shape[0], 3)
+
+        if perVertsTexture is None:
+            perVertsTexture = torch.ones((self.nFrames, 5023, 3), dtype=torch.float32, device=self.device)
+        else: 
+            perVertsTexture.to(device=self.device, dtype=torch.float32)
+            # v_min = perVertsTexture.min()
+            # v_max = perVertsTexture.max()
+            # perVertsTexture = (perVertsTexture - v_min) / (v_max - v_min)
+            # print(perVertsTexture)
+
+        headMesh = Meshes(verts=perFrameVerts, faces=perFrameFaces)
+        headMesh.textures = TexturesVertex(verts_features=perVertsTexture)
+                
+        # if savePath is not None: self.renderAnimation(savePath, customVerts=sampledSeq * 2, dist=dist)
+        verts_all  = headMesh.verts_padded() * scale            # [B, V, 3]
+        faces_all  = headMesh.faces_padded()                    # [B, F, 3]
+        feat_all   = headMesh.textures.verts_features_padded()  # [B, V, C]
+
+        B = verts_all.shape[0]   # total number of frames
         out = []
+
+        def render_chunk(start, end, dist=dist):
+            """Helper to build a sub‐Meshes and render it."""
+            chunk = Meshes(
+                verts=verts_all[start:end],
+                faces=faces_all[start:end],
+                textures=TexturesVertex(verts_features=feat_all[start:end])
+            )
+            return self.renderAnimation(chunk, dist=dist, elev=elev, azim=azim, resolution=resolution)
+
+        try:
+            if B <= 491:
+                # one‐shot render
+                out.append(render_chunk(0, B, dist=dist))
+            else:
+                # first 491 frames
+                out.append(render_chunk(0, 491, dist=dist))
+                # remaining frames
+                out.append(render_chunk(491, B, dist=dist))
+        except RuntimeError as e:
+            # capture which chunk failed
+            print(f"→ Illegal memory access during frames {491}–{B}")
+            print(savePath)
+            print(e)
+            # you could decide to continue on the next chunk or break outright
+            # here we just stop and return whatever we've got so far
+            return torch.cat(out, dim=0) if out else None
+
+        out = torch.cat(out, dim=0)
+
+        if savePath is not None:
+            frames_rgb = (out[..., :3] * 255).byte().cpu().numpy()  
+            imageio.mimsave(savePath, frames_rgb, fps=30, quality=10) 
+            return perFrameVerts
+        else:
+            return perFrameVerts
+        
+        
+    def batch_uv(self, paths, resolution=256, sample_frames=50, rotation=True):
+        out = []
+        min_frame = 10000000
         for path in paths:
             self.loadSequence(path)
-            self.LSB()                                           
-            uvMesh = self.convertUV()                                            
+            x = self.LSB(rotation=rotation) 
+            frame, _, _ = x.shape    
+            if frame < min_frame: min_frame = frame                                       
+            uvMesh = self.convertUV(rotation=rotation)                     
             uv = self.get_uv_animation(uvMesh, resolution=resolution, sample_frames=sample_frames) 
             out.append(uv[..., :3].unsqueeze(0))
+        out = [item[:, :min_frame, ...] for item in out]
         return torch.concat(out, dim=0)
 

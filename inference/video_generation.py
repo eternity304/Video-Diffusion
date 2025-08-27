@@ -9,7 +9,9 @@ import random
 import numpy as np
 import sys
 import imageio
+
 import torch
+import torchaudio
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
@@ -18,19 +20,23 @@ from accelerate.logging import get_logger
 from data.VideoDataset import VideoDataset 
 from torch.utils.data import DataLoader, DistributedSampler
 
-from diffusers import AutoencoderKLCogVideoX, CogVideoXDDIMScheduler
-from model.cap_transformer import CAPVideoXTransformer3DModel
+from diffusers import CogVideoXDDIMScheduler
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
-from inference._inference_pipeline import *
-from data.VideoDataset import *
+from original.dit import CAPVideoXTransformer3DModel
 from model.flameObj import *
+from model.causalvideovae.model import *
 
+from original.inference_pipeline import *
+from data.VideoDataset import *
+from wf_vae.model import *
 
 def parse_args(arg_list=None):
     parser = argparse.ArgumentParser(description="Unconditioned Video Diffusion Inference")
 
     parser.add_argument("--dataset-path", type=str, required=True, help="Directory containing input reference videos.")
     parser.add_argument("--pretrained-model-name-or-path", type=str, required=True, help="Path or HF ID where transformer/vae/scheduler are stored.")
+    parser.add_argument("--audio-model-path", type=str, required=True, default=None)
     parser.add_argument("--ckpt-path", type=str, required=True, help="Path to fine‐tuned checkpoint containing transformer state_dict.")
     parser.add_argument("--output-path", type=str, required=True, help="Where to write generated videos.")
     parser.add_argument("--model-config", type=str, required=True, help="YAML file describing model params (height, width, num_reference, num_target, etc.)")
@@ -41,10 +47,94 @@ def parse_args(arg_list=None):
     parser.add_argument("--shuffle", type=int, default=False, help="Whether to shuffle dataset. Usually False for inference.")
     parser.add_argument("--sample-frames", type=int, default=50)
     parser.add_argument("--output-dir", type=str)
+    parser.add_argument("--vae-ckpt", type=str, default=None)
 
     # If arg_list is None, argparse picks up sys.argv; 
     # otherwise it treats arg_list as the full argv list.
     return parser.parse_args(arg_list)
+
+def encode_audio(
+    audio_model, audio, sample_positions
+):
+    # print("AUDIO_DTYPE", audio.dtype)
+    features = audio_model(audio).last_hidden_state.to(dtype=sample_positions.dtype)
+    assert sample_positions.shape[0] == 1  # assert batch size of one
+    first_index = (sample_positions[0][0] * features.shape[1]).long()  # WARNING: BATCH SIZE SQUEEZE
+    last_index = (sample_positions[0][-1] * features.shape[1] + 1).long()  # WARNING: BATCH SIZE SQUEEZE
+
+    # print(sample_positions.min(), sample_positions.max(), sample_positions.shape)
+    # print("audio", first_index, last_index, features.shape)
+
+    audio_embeds = features[:, first_index:last_index]
+
+    return audio_embeds
+
+def load_audio(
+    audio_path: str,
+    frame_ids: np.ndarray,
+    n_timesteps: int,
+    audio_window: int,
+    audio_processor: Wav2Vec2Processor,
+    min_n_frames: int = 0,
+):
+    # calculate frame per seconds with num frames and audio duration
+    target_rate = 16000
+
+    if audio_path is not None and os.path.exists(audio_path) and len(frame_ids) >= min_n_frames:
+        input_audio, rate = torchaudio.load(str(audio_path))
+        input_audio = input_audio[0]
+
+        # duration = len(raw_audio) / rate
+
+        if rate != target_rate:
+            input_audio = torchaudio.functional.resample(input_audio, rate, target_rate)
+
+        if n_timesteps <= max(frame_ids):
+            # pad the audio wav
+            n_samples_per_frame = input_audio.shape[0] / n_timesteps
+            input_audio = F.pad(input_audio, (0, math.ceil(n_samples_per_frame * (max(frame_ids) - n_timesteps + 1))))
+            n_timesteps = max(frame_ids) + 1
+
+        audio_start = frame_ids[0]
+        extended_audio_start = max(0, audio_start - audio_window)
+        audio_end = frame_ids[-1] + 1
+        extended_audio_end = min(n_timesteps, audio_end + audio_window)
+
+        def to_sample(frame_id):
+            return int(frame_id / n_timesteps * input_audio.shape[0])
+
+        extended_audio = input_audio[to_sample(extended_audio_start):to_sample(extended_audio_end)]
+        raw_audio = input_audio[to_sample(audio_start):to_sample(audio_end)].numpy()
+
+        # this is where the extracted features are grid_sampled from
+        sample_positions = (frame_ids - extended_audio_start) / (extended_audio_end - extended_audio_start)
+
+        processed_audio = audio_processor(
+            extended_audio,
+            sampling_rate=target_rate,
+        ).input_values[0]
+        
+        return True, raw_audio, processed_audio, sample_positions
+    else:
+        # no audio found, return zeros
+        audio_features = np.zeros((target_rate)) # int(frame_ids.shape[0] / 25 * target_rate)))
+        sample_positions = np.arange(len(frame_ids)) / len(frame_ids)
+
+        return False, audio_features, audio_features, sample_positions
+    
+def batch_audio(paths, n_timesteps, audio_processor):
+    out_audio, out_positions = [], []
+
+    assert len(paths) == 1
+
+    for path in paths:
+        audio_path = os.path.join(os.path.dirname(path), "audio.m4a")
+        _, _, audio, sample_positions = load_audio(audio_path, frame_ids=np.arange(0,n_timesteps), n_timesteps=n_timesteps, audio_window=25, audio_processor=audio_processor)
+        audio, sample_positions = torch.from_numpy(audio).unsqueeze(0), torch.from_numpy(sample_positions).unsqueeze(0)
+        out_audio.append(audio)
+        out_positions.append(sample_positions)
+
+    return torch.concat(out_audio, dim=0), torch.concat(out_positions, dim=0)
 
 def save_video(video_tensor, path):
     video_tensor = video_tensor.squeeze(0)  # [3, 49, 256, 256]
@@ -59,8 +149,8 @@ def save_video(video_tensor, path):
 def encode_video(vae, video):
     video = video.to(vae.device, dtype=vae.dtype)
     video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-    with torch.no_grad(): latent_dist = vae.encode(video).latent_dist.sample() * vae.config.scaling_factor
-    return latent_dist.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format)
+    with torch.no_grad(): latent_dist = vae.encode(video).latent_dist.sample() 
+    return latent_dist.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format) * vae.config.scale[0]
 
 def main(args):
     with open(args.model_config, "r") as f: model_config = yaml.safe_load(f)
@@ -119,9 +209,21 @@ def main(args):
     flamePath = "/scratch/ondemand28/harryscz/head_audio/head/code/flame/flame2023_no_jaw.npz"
     sourcePath = "/scratch/ondemand28/harryscz/head_audio/head/data/vfhq-fit"
     dataPath = [os.path.join(os.path.join(sourcePath, data), "fit.npz") for data in os.listdir(sourcePath)]
-    seqPath = "/scratch/ondemand28/harryscz/head/_-91nXXjrVo_00/fit.npz"
 
     head = Flame(flamePath, device="cuda")
+
+    # audio_dtype = torch.float32
+
+    # audio_model = Wav2Vec2Model.from_pretrained(
+    #     args.audio_model_path, 
+    #     torch_dtype=audio_dtype, 
+    #     # attn_implementation="flash_attention_2",
+    # )
+    # audio_model.freeze_feature_encoder()
+    # audio_model.encoder.config.layerdrop = 0.
+    # audio_processor = Wav2Vec2Processor.from_pretrained(args.audio_model_path)
+
+    # audio_model.load_state_dict(ckpt["audio_state_dict"], strict=False)
 
     transformer = CAPVideoXTransformer3DModel.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -139,40 +241,59 @@ def main(args):
         apply_attention_scaling=model_config["use_growth_scaling"],
         use_rotary_positional_embeddings=False,
     )
-    vae = AutoencoderKLCogVideoX.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae"
-    )
+    # vae = AutoencoderKLCogVideoX.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="vae"
+    # )
+
+    model_cls = ModelRegistry.get_model("WFVAE")
+    vae = model_cls.from_pretrained("/scratch/ondemand28/harryscz/other/WF-VAE/weight")
+
+    if args.vae_ckpt:
+        vae_ckpt = torch.load(args.vae_ckpt, map_location="cpu")
+        vae.load_state_dict(vae_ckpt["state_dict"],  strict=False)
+        print("WF VAE checkpoint loaded!")
+
     scheduler = CogVideoXDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
-    vae.eval().to(weight_dtype)
-    transformer.eval().to(weight_dtype)
+    vae.to(weight_dtype)
+    transformer.train().to(weight_dtype)
 
     ckpt_path = args.ckpt_path
+    
     ckpt = torch.load(ckpt_path, map_location="cpu")
     transformer.load_state_dict(ckpt["state_dict"], strict=False)
 
     vae, transformer, scheduler, data_loader = accelerator.prepare(vae, transformer, scheduler, data_loader)
-
+    
     pipe = CAPVideoPipeline(
         vae=vae,
         transformer=transformer,
         scheduler=scheduler
     )
     
-    for i in range(0,10):
+    def decode_video(vae, latents):
+        with torch.no_grad():
+            latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]
+            frames = vae.decode(latents / vae.config.scale[0]).sample
+            return frames
+
+    for i in range(0, 1):
+
         batch = dataPath[i:i+1]
-        print(batch)
+        print(i, batch)
 
         latent_chunks = []
         uncond_latent_chunks = []
         cond_chunks = []
         uncond_chunks = []
-        cond_vises = []
         ref_mask_chunks = []
 
-        uvs = head.batch_uv(batch, resolution=256, sample_frames=args.sample_frames).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
+        uvs = head.batch_uv(batch, resolution=256, sample_frames=args.sample_frames, rotation=False).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
+        # audio_chunks, sample_pos_chunks = batch_audio(batch, n_timesteps=args.sample_frames, audio_processor=audio_processor)
+        # audio_chunks, sample_pos_chunks = audio_chunks.to(device=audio_model.device, dtype=weight_dtype), sample_pos_chunks.to(device=audio_model.device, dtype=weight_dtype)
+        
         ref_frame = uvs[:, 0, :, :, :].unsqueeze(1) # B, 1, C, H, W
 
         latent_chunk = encode_video(vae, uvs).to(dtype=dtype)
@@ -181,7 +302,6 @@ def main(args):
         ref_latent[:, 0, ...] = _ref_latent.squeeze(1)
         ref_mask = torch.zeros(latent_chunk.shape).to(accelerator.device)
         ref_mask[:, 0, ...] = 1.0
-
         # ref_mask_chunks.append(cond_chunk["ref_mask"].permute(0, 1, 4, 2, 3))
         # cond_vis = conditioning.get_vis(cond_chunk["condition"])
         # cond_chunk = einops.rearrange(cond_chunk["condition"], 'b f h w c -> b f c h w').to(device=device)
@@ -202,9 +322,12 @@ def main(args):
         #     )
         # if not batch["has_audio"][0]:  # if there is no audio, set audio encoding to zero
         #     audio_encoding = audio_encoding * 0.
+
         audio_encoding = torch.zeros(
-            (B, 3, 768), dtype=torch.float32, device=accelerator.device
+            (B, F_z, 3072), dtype=torch.float32, device=accelerator.device
         )
+        # audio_encoding = encode_audio(audio_model=audio_model, audio=audio_chunks, sample_positions=sample_pos_chunks)
+
         uncond_audio_encoding = audio_encoding * 0.
         text_embeds = torch.zeros(1, 1, 1920, device=device, dtype=dtype)
 
@@ -212,10 +335,19 @@ def main(args):
         for chunk_id, latent in enumerate(latent_chunks):
             sequence_infos.append((False, torch.arange(0, latent.shape[1], device=accelerator.device)))
 
+        orig = uvs[0].permute(0,2,3,1)
+        torch.save(orig, "diffOut/gt.pt")
+        with torch.no_grad():
+            z = vae.encode(orig.permute(3,0,1,2).unsqueeze(0)) # input shape : C, T, H, W
+            latents = z.latent_dist.sample()
+            orig = vae.decode(latents).sample
+
+        orig = orig[0].permute(1,2,3,0)
+
         out = pipe(
             height=256,
             width=256,
-            num_frames=29,
+            num_frames=args.sample_frames,
             num_inference_steps=50,
             conditioning=cond_chunks,
             uncond_conditioning=uncond_chunks,
@@ -228,87 +360,22 @@ def main(args):
             uncond_text_embeds=text_embeds,
             sequence_infos=sequence_infos, 
             output_type="pt",
+            gt=latents.permute(0,2,1,3,4) * vae.config.scale[0]
         )
-
-        orig = uvs[0].permute(0,2,3,1)
-        recon = out[0][0][0].permute(0,2,3,1)
-
-        sampledUV = head.sampleFromUV(orig, savePath=f"diffOut/{i}_uv.mp4") # input has shape F, H, W, C
-        head.sampleTo3D(sampledUV, savePath=f"diffOut/{i}_3d.mp4", resolution=512, dist=1.2)
-
-        sampledUV = head.sampleFromUV(recon, savePath=f"diffOut/{i}_diff_uv.mp4") # input has shape F, H, W, C
-        head.sampleTo3D(sampledUV, savePath=f"diffOut/{i}_diff_3d.mp4", resolution=512, dist=1.2)
-    
-    # latent_chunks = []
-    # uncond_latent_chunks = []
-    # cond_chunks = []
-    # uncond_chunks = []
-    # cond_vises = []
-    # ref_mask_chunks = []
-    # for chunk_id in range(len(batch["video_chunks"])):
         
-    #     video = batch["video_chunks"][chunk_id].permute(0,2,1,3,4)
-    #     if video.shape[1] > args.sample_frames: video = video[:,:args.sample_frames,...]   
-    #     latent_chunk = encode_video(vae, video).to(dtype=weight_dtype)
- 
-    #     # cond_chunk = {key: batch["cond_chunks"][key][chunk_id] for key in batch["cond_chunks"]}
-    #     # for key in cond_chunk:
-    #     #     cond_chunk[key] = cond_chunk[key].to(dtype=torch.float32, device=device)
-    #     ref_frame = video[:, 0, :, :, :].unsqueeze(1) # B, 1, C, H, W
-    #     _ref_latent = encode_video(vae, ref_frame).to(dtype=weight_dtype)
-    #     ref_latent = torch.zeros(latent_chunk.shape).to(dtype=weight_dtype, device=accelerator.device)
-    #     ref_latent[:, 0, ...] = _ref_latent.squeeze(1)
-    #     ref_mask = torch.zeros(latent_chunk.shape).to(accelerator.device)
-    #     ref_mask[:, 0, ...] = 1.0
-
-    #     # ref_mask_chunks.append(cond_chunk["ref_mask"].permute(0, 1, 4, 2, 3))
-    #     # cond_vis = conditioning.get_vis(cond_chunk["condition"])
-    #     # cond_chunk = einops.rearrange(cond_chunk["condition"], 'b f h w c -> b f c h w').to(device=device)
-    #     # cond_chunk = cond_chunk.to(dtype=dtype)
-    #     latent_chunks.append(latent_chunk)
-    #     uncond_latent_chunks.append(latent_chunk * 0.)
-    #     cond_chunks.append(ref_latent)
-    #     # cond_vises.append(cond_vis)
-    #     uncond_chunks.append(ref_latent * 0.)
-    #     ref_mask_chunks.append(ref_mask)
-    #     B, F_z, C, H_z, W_z = latent_chunks[0].shape
+        # breakpoint()
         
-    # # with torch.no_grad():
-    # #     audio_encoding = encode_audio(
-    # #         audio_model=audio_model,
-    # #         audio=batch["audio"].to(dtype=dtype, device=device),
-    # #         sample_positions=batch["sample_positions"].to(dtype=dtype, device=device),
-    # #     )
-    # # if not batch["has_audio"][0]:  # if there is no audio, set audio encoding to zero
-    # #     audio_encoding = audio_encoding * 0.
-    # audio_encoding = torch.zeros(
-    #     (B, 3, 768), dtype=weight_dtype, device=accelerator.device
-    # )
-    # uncond_audio_encoding = audio_encoding * 0.
-    # text_embeds = torch.zeros(1, 1, 1920, device=device, dtype=weight_dtype)
+        # recon = out[0][0][0].permute(0,2,3,1)
+        recon = decode_video(vae, out[1][0])[0].permute(1,2,3,0)
 
-    # sequence_infos = []
-    # for chunk_id, latent in enumerate(latent_chunks):
-    #     sequence_infos.append((False, torch.arange(0, latent.shape[1], device=accelerator.device)))
+        torch.save(orig, "diffOut/vae_gt.pt")
+        torch.save(recon, "diffOut/overfit.pt")
+        
+        sampledUV = head.sampleFromUV(orig, savePath=f"diffOut/_no_{i}_uv.mp4") # input has shape F, H, W, C
+        head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_3d.mp4", resolution=512, dist=1.2, rotation=False)
 
-    # out = pipe(
-    #     height=512,
-    #     width=512,
-    #     num_frames=29,
-    #     num_inference_steps=50,
-    #     conditioning=cond_chunks,
-    #     uncond_conditioning=uncond_chunks,
-    #     latents=latent_chunks,
-    #     uncond_latents=uncond_latent_chunks,
-    #     ref_mask_chunks=ref_mask_chunks,
-    #     audio_embeds=audio_encoding,
-    #     uncond_audio_embeds=uncond_audio_encoding,
-    #     text_embeds=text_embeds,
-    #     uncond_text_embeds=text_embeds,
-    #     sequence_infos=sequence_infos, 
-    #     output_type="pt",
-    # )
-
+        sampledUV = head.sampleFromUV(recon, savePath=f"diffOut/_no_{i}_diff_uv.mp4") # input has shape F, H, W, C
+        head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_diff_3d.mp4", resolution=512, dist=1.2, rotation=False)
     
 
 if __name__ == "__main__":

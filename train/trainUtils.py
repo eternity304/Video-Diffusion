@@ -78,6 +78,23 @@ def prepare_rotary_positional_embeddings(
     freqs_sin = freqs_sin.to(device=device)
     return freqs_cos, freqs_sin
 
+def collate_fn(examples):
+    # chunks = examples[0]["chunks"]  # TODO: this is a hack, only one chunking supported
+
+    output_dict = {}
+
+    if "video" in examples[0]:
+        videos = [torch.tensor(example["video"]) for example in examples]
+
+        videos = torch.stack(videos)
+        videos = videos.to(memory_format=torch.contiguous_format).float()
+        videos = einops.rearrange(videos, 'b f h w c -> b f c h w')
+        video_chunks = videos.split(chunks, dim=1)
+
+        output_dict["video_chunks"] = video_chunks
+
+    return output_dict
+
 def log_validation(
     file_name: str,
     output_dir: Path,

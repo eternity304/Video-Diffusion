@@ -2,12 +2,15 @@ import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchvision.models import vgg16, VGG16_Weights
+import torch.nn.functional as F
+import torch.nn as nn
 
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 import argparse
 import logging
 import tqdm
-from itertools import chain
+from itertools import chain, islice
 import wandb
 import random
 import numpy as np
@@ -213,7 +216,8 @@ def train(args):
             ckpt_dir.mkdir(exist_ok=False, parents=True)
         except:
             logger.warning(f"`{ckpt_dir}` exists!")
-    dist.barrier()
+
+    dist.barrier(device_ids=[rank])
 
     # load generator model
     model_cls = ModelRegistry.get_model(args.model_name)
@@ -225,15 +229,19 @@ def train(args):
 
     if args.pretrained_model_name_or_path is not None:
         if global_rank == 0:
-            logger.warning(
-                f"You are loading a checkpoint from `{args.pretrained_model_name_or_path}`."
+            logger.warning(f"Loading checkpoint from {args.pretrained_model_name_or_path}")
+        
+        # Add timeout and error handling
+        try:
+            model = model_cls.from_pretrained(
+                args.pretrained_model_name_or_path,
+                ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+                low_cpu_mem_usage=False,
+                device_map=None,
             )
-        model = model_cls.from_pretrained(
-            args.pretrained_model_name_or_path,
-            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-            low_cpu_mem_usage=False,
-            device_map=None,
-        )
+        except Exception as e:
+            logger.error(f"Rank {global_rank}: Failed to load model: {e}")
+            raise e
     else:
         if global_rank == 0:
             logger.warning(f"Model will be inited randomly.")
@@ -287,15 +295,33 @@ def train(args):
     flame = Flame(args.flame_path, device="cuda")
 
     # load dataset
-    dataset = TrainVideoDataset(
-        args.video_path,
-        sequence_length=args.num_frames,
-        resolution=args.resolution,
-        sample_rate=args.sample_rate,
-        dynamic_sample=args.dynamic_sample,
-        cache_file="idx.pkl", # Cache idx
-        is_main_process=global_rank == 0,
-    )
+    if global_rank == 0:
+        dataset = TrainVideoDataset(
+            args.video_path,
+            sequence_length=args.num_frames,
+            resolution=args.resolution,
+            sample_rate=args.sample_rate,
+            dynamic_sample=args.dynamic_sample,
+            cache_file="idx.pkl",
+            is_main_process=True,
+        )
+
+    # Wait for rank 0 to finish creating cache
+    dist.barrier()
+
+    # Now other ranks can safely load
+    if global_rank != 0:
+        dataset = TrainVideoDataset(
+            args.video_path,
+            sequence_length=args.num_frames,
+            resolution=args.resolution,
+            sample_rate=args.sample_rate,
+            dynamic_sample=args.dynamic_sample,
+            cache_file="idx.pkl",
+            is_main_process=False,
+        )
+
+    dist.barrier()
     
     ddp_sampler = CustomDistributedSampler(dataset)
     dataloader = DataLoader(
@@ -424,9 +450,27 @@ def train(args):
         ddp_sampler.set_epoch(epoch)  # Shuffle data at every epoch
         
         for batch_idx, batch in enumerate(dataloader):
+        # for batch_idx, batch in enumerate(islice(dataloader, 1200, None), start=1200):
             # inputs = batch["video"].to(rank)
-            inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution).permute(0,4,1,2,3)
-            inputs = inputs.to(rank)
+            inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution)
+            inputs = inputs.permute(0,4,1,2,3).to(rank)
+
+            # Check for bad input
+            bad_loc = torch.tensor(
+                inputs.shape[2] != args.num_frames,
+                dtype=torch.uint8,
+                device=inputs.device
+            )
+
+            # do an ALL‐REDUCE so every rank learns if any rank was "bad"
+            dist.all_reduce(bad_loc, op=dist.ReduceOp.MAX)
+
+            if bad_loc.item():  # if ANY rank saw a mismatch
+                if inputs.shape[2] != args.num_frames:
+                    print(f" Skipping bad batch on rank {rank} @ step {current_step}", batch, inputs.shape)
+                update_bar(bar)
+                current_step += 1
+                continue
             
             # select generator or discriminator
             if (
@@ -453,7 +497,16 @@ def train(args):
                 wavelet_coeffs = None
                 if outputs.extra_output is not None and args.wavelet_loss:
                     wavelet_coeffs = outputs.extra_output
-                    
+
+            # Per Vertex Loss
+            B, C, T, W, H = inputs.shape
+            _recon = recon[:, :, :T, ...]
+            l1_loss = nn.L1Loss()
+            vertex_loss = l1_loss(
+                flame.sampleFromUV(_recon.permute(0,2,3,4,1).view(B*T, W, H, C)),
+                flame.sampleFromUV(inputs.permute(0,2,3,4,1).view(B*T, W, H, C))
+            )
+            
             # generator loss
             if step_gen:
                 with torch.amp.autocast('cuda', dtype=precision):
@@ -466,6 +519,7 @@ def train(args):
                         last_layer=model.module.get_last_layer(),
                         wavelet_coeffs=wavelet_coeffs,
                         split="train",
+                        vertex_loss=vertex_loss
                     )
                 gen_optimizer.zero_grad()
                 scaler.scale(g_loss).backward()

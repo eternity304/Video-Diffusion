@@ -1,6 +1,4 @@
-unset https_proxy
 export WANDB_PROJECT=WFVAE
-export CUDA_VISIBLE_DEVICES=0,1
 # export GLOO_SOCKET_IFNAME=bond0
 # export NCCL_SOCKET_IFNAME=bond0
 # export NCCL_IB_HCA=mlx5_10:1,mlx5_11:1,mlx5_12:1,mlx5_13:1
@@ -13,12 +11,14 @@ export NCCL_ALGO=Ring
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
+# export NCCL_DEBUG=INFO  # Add this temporarily to see what's happening
+# export NCCL_TIMEOUT=600  # Increase timeout
+# export NCCL_ASYNC_ERROR_HANDLING=1
+# export NCCL_TREE_THRESHOLD=0  
+
 EXP_NAME=WFVAE
 
-torchrun \
-    --nnodes=1 --nproc_per_node=2 \
-    --master_addr=localhost \
-    --master_port=12135 \
+torchrun --nproc_per_node=3 \
     -m train.vae.train_ddp \
     --exp_name ${EXP_NAME} \
     --pretrained_model_name_or_path /scratch/ondemand28/harryscz/other/WF-VAE/weight \
@@ -33,10 +33,10 @@ torchrun \
     --num_frames 25 \
     --batch_size 1 \
     --lr 0.00001 \
-    --epochs 4 \
+    --epochs 10 \
     --disc_start 0 \
     --log_steps 1 \
-    --save_ckpt_step 5000 \
+    --save_ckpt_step 500 \
     --eval_steps 1000 \
     --eval_batch_size 1 \
     --eval_num_frames 25 \

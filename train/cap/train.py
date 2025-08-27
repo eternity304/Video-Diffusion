@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torchaudio
 import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
@@ -36,12 +37,14 @@ from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
 from huggingface_hub import create_repo, upload_folder
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms
+import torch.distributed as dist
 from tqdm.auto import tqdm
 import numpy as np
 from decord import VideoReader
-from transformers import Wav2Vec2Model
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
 import cv2
+import warnings
 
 import diffusers
 from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler
@@ -49,9 +52,12 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, export_to_video, is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from data.VideoDataset import VideoDataset, video_collate
+from data.VideoDataset import *
 from train.trainUtils import collate_fn
 from model.cap_transformer import CAPVideoXTransformer3DModel
+from model.flameObj import *
+from wf_vae.model import *
+from model.causalvideovae.model import *
 
 if is_wandb_available():
     import wandb
@@ -394,6 +400,19 @@ def get_args():
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
+    parser.add_argument(
+        "--vae_ckpt",
+        type=str,
+        default=None,
+        help=(
+            'ckpt for wfvae'
+        ),
+    )
+    parser.add_argument(
+        "--audio_model_path",
+        type=str,
+        default=None
+    )
 
     return parser.parse_args()
 
@@ -495,29 +514,88 @@ def read_video(video_path, start_index=0, frames_count=49, stride=1):
 #     return prompt_embeds
 
 
-# def encode_audio(
-#     audio_model, audio, sample_positions, n_latents, temporal_compression_ratio,
-# ):
-#     # print("AUDIO_DTYPE", audio.dtype)
-#     features = audio_model(audio).last_hidden_state.to(dtype=sample_positions.dtype)
+def encode_audio(
+    audio_model, audio, sample_positions
+):
+    # print("AUDIO_DTYPE", audio.dtype)
+    features = audio_model(audio).last_hidden_state.to(dtype=sample_positions.dtype)
+    assert sample_positions.shape[0] == 1  # assert batch size of one
+    first_index = (sample_positions[0][0] * features.shape[1]).long()  # WARNING: BATCH SIZE SQUEEZE
+    last_index = (sample_positions[0][-1] * features.shape[1] + 1).long()  # WARNING: BATCH SIZE SQUEEZE
 
-#     assert sample_positions.shape[0] == 1  # assert batch size of one
-#     first_index = (sample_positions[0][0] * features.shape[1]).long()  # WARNING: BATCH SIZE SQUEEZE
-#     last_index = ((sample_positions[0][-1] + 1) * features.shape[1]).long()  # WARNING: BATCH SIZE SQUEEZE
+    # print(sample_positions.min(), sample_positions.max(), sample_positions.shape)
+    # print("audio", first_index, last_index, features.shape)
 
-#     # print(sample_positions.min(), sample_positions.max(), sample_positions.shape)
-#     # print("audio", first_index, last_index, features.shape)
+    audio_embeds = features[:, first_index:last_index]
 
-#     audio_embeds = features[:, first_index:last_index]
+    return audio_embeds
 
-#     n_frames = (n_latents - 1) * temporal_compression_ratio + 1
-#     audio_embeds = F.interpolate(audio_embeds.permute(0, 2, 1)[..., None], (n_frames, 1), mode="bilinear", align_corners=False)
-#     audio_embeds = audio_embeds[..., 0].permute(0, 2, 1) # B T C
-#     audio_embeds = F.pad(audio_embeds, (0, 0, temporal_compression_ratio-1, 0), mode="constant", value=0.)
-#     audio_embeds = einops.rearrange(audio_embeds, 'b (t s) c -> b t (s c)', s=temporal_compression_ratio)
+def load_audio(
+    audio_path: str,
+    frame_ids: np.ndarray,
+    n_timesteps: int,
+    audio_window: int,
+    audio_processor: Wav2Vec2Processor,
+    min_n_frames: int = 0,
+):
+    # calculate frame per seconds with num frames and audio duration
+    target_rate = 16000
 
-#     return audio_embeds
+    if audio_path is not None and os.path.exists(audio_path) and len(frame_ids) >= min_n_frames:
+        input_audio, rate = torchaudio.load(str(audio_path))
+        input_audio = input_audio[0]
 
+        # duration = len(raw_audio) / rate
+
+        if rate != target_rate:
+            input_audio = torchaudio.functional.resample(input_audio, rate, target_rate)
+
+        if n_timesteps <= max(frame_ids):
+            # pad the audio wav
+            n_samples_per_frame = input_audio.shape[0] / n_timesteps
+            input_audio = F.pad(input_audio, (0, math.ceil(n_samples_per_frame * (max(frame_ids) - n_timesteps + 1))))
+            n_timesteps = max(frame_ids) + 1
+
+        audio_start = frame_ids[0]
+        extended_audio_start = max(0, audio_start - audio_window)
+        audio_end = frame_ids[-1] + 1
+        extended_audio_end = min(n_timesteps, audio_end + audio_window)
+
+        def to_sample(frame_id):
+            return int(frame_id / n_timesteps * input_audio.shape[0])
+
+        extended_audio = input_audio[to_sample(extended_audio_start):to_sample(extended_audio_end)]
+        raw_audio = input_audio[to_sample(audio_start):to_sample(audio_end)].numpy()
+
+        # this is where the extracted features are grid_sampled from
+        sample_positions = (frame_ids - extended_audio_start) / (extended_audio_end - extended_audio_start)
+
+        processed_audio = audio_processor(
+            extended_audio,
+            sampling_rate=target_rate,
+        ).input_values[0]
+        
+        return True, raw_audio, processed_audio, sample_positions
+    else:
+        # no audio found, return zeros
+        audio_features = np.zeros((target_rate)) # int(frame_ids.shape[0] / 25 * target_rate)))
+        sample_positions = np.arange(len(frame_ids)) / len(frame_ids)
+
+        return False, audio_features, audio_features, sample_positions
+    
+def batch_audio(paths, n_timesteps, audio_processor):
+    out_audio, out_positions = [], []
+
+    assert len(paths) == 1
+
+    for path in paths:
+        audio_path = os.path.join(os.path.dirname(path), "audio.m4a")
+        _, _, audio, sample_positions = load_audio(audio_path, frame_ids=np.arange(0,n_timesteps), n_timesteps=n_timesteps, audio_window=25, audio_processor=audio_processor)
+        audio, sample_positions = torch.from_numpy(audio).unsqueeze(0), torch.from_numpy(sample_positions).unsqueeze(0)
+        out_audio.append(audio)
+        out_positions.append(sample_positions)
+
+    return torch.concat(out_audio, dim=0), torch.concat(out_positions, dim=0)
 
 # def prepare_rotary_positional_embeddings(
 #     height: int,
@@ -721,7 +799,7 @@ def main(args):
 
     # CogVideoX-2b weights are stored in float16
     # CogVideoX-5b and CogVideoX-5b-I2V weights are stored in bfloat16
-    
+
     load_dtype = torch.bfloat16 if "5b" in args.pretrained_model_name_or_path.lower() else torch.float16
     transformer = CAPVideoXTransformer3DModel.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -732,7 +810,7 @@ def main(args):
         torch_dtype=load_dtype,
         revision=args.revision,
         variant=args.variant,
-        cond_in_channels=1,
+        cond_in_channels=16,
         sample_width=model_config_yaml["width"] // 8,
         sample_height=model_config_yaml["height"] // 8,
         sample_frames=args.sample_frames,
@@ -741,16 +819,18 @@ def main(args):
         apply_attention_scaling=model_config_yaml["use_growth_scaling"],
     )
 
-    # audio_dtype = torch.bfloat16
+    audio_dtype = torch.float32
 
-    # if model_config_yaml["use_audio"]:
-    #     audio_model = Wav2Vec2Model.from_pretrained(
-    #         "facebook/wav2vec2-base", 
-    #         torch_dtype=audio_dtype, 
-    #         attn_implementation="flash_attention_2",
-    #     )
-    #     audio_model.freeze_feature_encoder()
-    #     audio_model.encoder.config.layerdrop = 0.
+    if model_config_yaml["use_audio"]:
+        audio_model = Wav2Vec2Model.from_pretrained(
+            args.audio_model_path, 
+            torch_dtype=audio_dtype, 
+            # attn_implementation="flash_attention_2",
+        )
+        audio_model.freeze_feature_encoder()
+        audio_model.encoder.config.layerdrop = 0.
+        audio_processor = Wav2Vec2Processor.from_pretrained(args.audio_model_path)
+
 
     #################################################################################################################
     #################################################################################################################
@@ -760,10 +840,9 @@ def main(args):
 
     # Dataset and DataLoader
     # dataset_config = OmegaConf.load(args.dataset_config_path)
-    train_dataset: VideoDataset = VideoDataset(
-        "/scratch/ondemand28/harryscz/head_audio/data/data256/uv"
+    train_dataset: VideoPathDataset = VideoPathDataset(
+        "/scratch/ondemand28/harryscz/head_audio/head/data/vfhq-fit"
     )
-
     sampler = DistributedSampler(
         train_dataset, 
         num_replicas=accelerator.num_processes, 
@@ -777,7 +856,7 @@ def main(args):
         train_dataset,
         batch_size=args.train_batch_size,
         sampler=sampler, 
-        collate_fn=video_collate,
+        collate_fn=lambda x: x,
         num_workers=args.dataloader_num_workers,
         worker_init_fn=worker_init_fn,
     )
@@ -788,22 +867,31 @@ def main(args):
     #     cam_conditioning = CAPCameraConditioning(use_positional_encoding=model_config_yaml["use_camera_pos_enc"])
     #     cam_conditioning.requires_grad_(False)
 
-    vae = AutoencoderKLCogVideoX.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-    )
-    
+    # vae = AutoencoderKLCogVideoX.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    # )
+
+    # Load WF VAE
+    model_cls = ModelRegistry.get_model("WFVAE")
+    vae = model_cls.from_pretrained("/scratch/ondemand28/harryscz/other/WF-VAE/weight")
+
+    if args.vae_ckpt:
+        ckpt = torch.load(args.vae_ckpt, map_location="cpu")
+        vae.load_state_dict(ckpt["state_dict"],  strict=False)
+        print("WF VAE checkpoint loaded!")
+
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    if args.enable_slicing:
-        vae.enable_slicing()
-    if args.enable_tiling:
-        vae.enable_tiling()
+    # if args.enable_slicing:
+    #     vae.enable_slicing()
+    # if args.enable_tiling:
+    #     vae.enable_tiling()
 
     # We only train the additional adapter controlnet layers
     # if args.use_text:
     #     text_encoder.requires_grad_(False)
-    # if model_config_yaml["use_audio"]:
-    #     audio_model.requires_grad_(True)
+    if model_config_yaml["use_audio"]:
+        audio_model.requires_grad_(True)
     transformer.requires_grad_(True)
     vae.requires_grad_(False)
     # conditioning.requires_grad_(False)
@@ -859,10 +947,10 @@ def main(args):
 
     trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
-    # if model_config_yaml["use_audio"]:
-    #     audio_parameters = list(filter(lambda p: p.requires_grad, audio_model.parameters()))
-    #     print("number of audio layers:", len(audio_parameters))
-    #     trainable_parameters += audio_parameters
+    if model_config_yaml["use_audio"]:
+        audio_parameters = list(filter(lambda p: p.requires_grad, audio_model.parameters()))
+        print("number of audio layers:", len(audio_parameters))
+        trainable_parameters += audio_parameters
 
     # Optimization parameters
     trainable_parameters_with_lr = {"params": trainable_parameters, "lr": args.learning_rate}
@@ -894,22 +982,33 @@ def main(args):
 
             transformer.load_state_dict(recent_checkpoint["state_dict"])
 
-            # if model_config_yaml["use_audio"]:
-            #     audio_model.load_state_dict(recent_checkpoint["audio_state_dict"])
-        
-    def encode_video(video):
+            if model_config_yaml["use_audio"]:
+                audio_model.load_state_dict(recent_checkpoint["audio_state_dict"])
+    # TODO: make encode function better
+
+    # def encode_video(vae, video):
+    #     video = video.to(accelerator.device, dtype=vae.dtype)
+    #     video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+    #     latent_dist = vae.encode(video).latent_dist.sample() * vae.config.scaling_factor
+    #     return latent_dist.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format)
+
+    def encode_video(vae, video):
+        '''
+        input - vae; video, (B, T, C, H, W)
+        output - latent, (B, T, C, H, W)
+        '''
         video = video.to(accelerator.device, dtype=vae.dtype)
-        video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-        latent_dist = vae.encode(video).latent_dist.sample() * vae.config.scaling_factor
-        return latent_dist.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format)
+        video = video.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+        with torch.no_grad(): latents = vae.encode(video).latent_dist.sample()
+        return latents.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format)
 
     # if args.use_text:
     #     text_encoder.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     # conditioning.to(accelerator.device, dtype=torch.float32)
-    # if model_config_yaml["use_audio"]:
-    #     audio_model.to(accelerator.device, dtype=weight_dtype)
+    if model_config_yaml["use_audio"]:
+        audio_model.to(accelerator.device, dtype=weight_dtype)
     # if model_config_yaml["use_camera_conditioning"]:
     #     cam_conditioning.to(accelerator.device, dtype=torch.float32)
 
@@ -966,10 +1065,12 @@ def main(args):
         )
 
     # Prepare everything with our `accelerator`.
-    # if model_config_yaml["use_audio"]:
-    #     (transformer, audio_model), optimizer, lr_scheduler = accelerator.prepare(
-    #         (transformer, audio_model), optimizer, lr_scheduler
-    #     )
+    if model_config_yaml["use_audio"]:
+        (transformer, audio_model), optimizer, lr_scheduler = accelerator.prepare(
+            (transformer, audio_model), optimizer, lr_scheduler
+        )
+        # audio_model = audio_model.to(audio_dtype)
+        print(transformer.dtype, audio_model.dtype)
     #     # transformer, audio_model, optimizer, lr_scheduler = accelerator.prepare(
     #     #     transformer, audio_model, optimizer, lr_scheduler
     #     # )
@@ -983,9 +1084,15 @@ def main(args):
         torch.distributed.barrier()
         print(f"Rank {accelerator.process_index}: Passed barrier")
 
-    transformer, optimizer, lr_scheduler = accelerator.prepare(  # REMOVED train_dataloader
-        transformer, optimizer, lr_scheduler
-    )
+    # transformer, optimizer, lr_scheduler = accelerator.prepare(  # REMOVED train_dataloader
+    #     transformer, optimizer, lr_scheduler
+    # )
+
+    # TODO: organize args for flame obj
+    flamePath = "/scratch/ondemand28/harryscz/head_audio/head/code/flame/flame2023_no_jaw.npz"
+    sourcePath = "/scratch/ondemand28/harryscz/head_audio/head/data/vfhq-fit"
+
+    head = Flame(flamePath, device="cuda")
 
     if args.load_checkpoint_if_exists and recent_checkpoint is not None:
         if args.load_optimizer_state:
@@ -1031,7 +1138,7 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    vae_scale_factor_spatial = 2 ** (len(vae.config.block_out_channels) - 1)
+    # vae_scale_factor_spatial = 2 ** (len(vae.config.block_out_channels) - 1)
 
     print("TODO: implement multi ref and ref in dataloader")
     torch.cuda.empty_cache()
@@ -1039,28 +1146,72 @@ def main(args):
     # For DeepSpeed training
     model_config = transformer.module.config if hasattr(transformer, "module") else transformer.config
 
+    warnings.filterwarnings(
+        "ignore", 
+        message=r"Mtl file does not exist: .*",
+        category=UserWarning
+    )
+    # torch.autograd.set_detect_anomaly(True)
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
 
-        # if model_config_yaml["use_audio"]:
-        #     audio_model.train()
+        if model_config_yaml["use_audio"]:
+            audio_model.train()
 
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
-
-            # if model_config_yaml["use_audio"]:
-            #     models_to_accumulate += [audio_model]
+  
+            if model_config_yaml["use_audio"]:
+                models_to_accumulate += [audio_model]
 
             # TODO: IMPLEMENT CFG
             is_uncond = torch.rand(1) < args.unconditional_probability
 
             with accelerator.accumulate(models_to_accumulate):
                 latent_chunks = []
-                for chunk_id in range(len(batch["video_chunks"])):
-                    video = batch["video_chunks"].permute(0,2,1,3,4)
-                    if video.shape[1] > args.sample_frames: video = video[:,:args.sample_frames,...]   
-                    latent_chunk = encode_video(video).to(dtype=weight_dtype)
-                    latent_chunks.append(latent_chunk)
+                cond_chunks = []
+                ref_mask_chunks = []
+                # for chunk_id in range(len(batch["video_chunks"])):
+
+                # TODO add resolution args
+                try:
+                    uvs = head.batch_uv(batch, resolution=model_config_yaml["width"], sample_frames=args.sample_frames, rotation=False).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
+
+                except:
+                    print(batch)
+                    continue
+
+                # Check for bad input
+                # bad_loc = torch.tensor(
+                #     uvs.shape[1] != args.sample_frames,
+                #     dtype=torch.uint8,
+                #     device=uvs.device
+                # )
+
+                # do an ALL‐REDUCE so every rank learns if any rank was "bad"
+                # dist.all_reduce(bad_loc, op=dist.ReduceOp.MAX)
+
+                # if bad_loc.item():  # if ANY rank saw a mismatch
+                #     if uvs.shape[2] != args.sample_frames:
+                #         print(f" Skipping bad batch on rank {accelerator.process_index} @ step {global_step}", batch, uvs.shape)
+                #     progress_bar.update(1)
+                #     global_step += 1
+                #     continue
+
+                ref_frame = uvs[:, 0, :, :, :].unsqueeze(1) # B, 1, C, H, W
+
+                latent_chunk = encode_video(vae, uvs).to(dtype=weight_dtype)
+                _ref_latent = encode_video(vae, ref_frame).to(dtype=weight_dtype)
+                ref_latent = torch.zeros(latent_chunk.shape).to(dtype=weight_dtype, device=accelerator.device)
+                ref_latent[:, 0, ...] = _ref_latent.squeeze(1)
+                ref_mask = torch.zeros(latent_chunk.shape).to(accelerator.device)
+                ref_mask[:, 0, ...] = 1.0
+
+                latent_chunks.append(latent_chunk) 
+                cond_chunks.append(ref_latent)
+                ref_mask_chunks.append(ref_mask)
+                # breakpoint()
+               
                     # batch_cond_chunk = {key: batch["cond_chunks"][key][chunk_id] for key in batch["cond_chunks"]}
                     # for key in batch_cond_chunk:
                     #     batch_cond_chunk[key] = batch_cond_chunk[key].to(dtype=torch.float32, device=accelerator.device)
@@ -1112,10 +1263,17 @@ def main(args):
                 #     if is_uncond:
                 #         audio_encoding = audio_encoding * 0.
                 # else:
-                #     # TODO creat audio encoding
-                audio_encoding = torch.zeros(
-                    batch_size, batch["video_chunks"][-1].shape[1], 768, dtype=weight_dtype, device=accelerator.device
-                )
+                #     # TODO create audio encoding
+                
+                # audio_encoding = encode_audio(audio_model=audio_model, audio=audio_chunks, sample_positions=sample_pos_chunks).to(weight_dtype)
+                if model_config_yaml["use_audio"]:
+                    audio_chunks, sample_pos_chunks = batch_audio(batch, n_timesteps=args.sample_frames, audio_processor=audio_processor)
+                    audio_chunks, sample_pos_chunks = audio_chunks.to(device=audio_model.device, dtype=weight_dtype), sample_pos_chunks.to(device=audio_model.device, dtype=weight_dtype)
+                    audio_encoding = encode_audio(audio_model=audio_model, audio=audio_chunks, sample_positions=sample_pos_chunks).to(weight_dtype) * 0.0
+                else:
+                    audio_encoding = torch.zeros(
+                        batch_size, 50, 768, dtype=weight_dtype, device=accelerator.device
+                    )
 
                 text_embeds = torch.zeros(batch_size, 1, 1920, device=accelerator.device, dtype=weight_dtype)
 
@@ -1153,61 +1311,65 @@ def main(args):
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
 
-                # TODO: ADD NOISE TO REF LATENTS!! ===========================================================================
-
                 noisy_latents = []
                 for chunk_id in range(len(latent_chunks)):
                     latent = latent_chunks[chunk_id]
-                    # ref_latent = latent * 0. if is_uncond else latent
-                    # ref_mask_chunk = ref_mask_chunks[chunk_id]
+                    ref_latent = cond_chunks[chunk_id]
+                    ref_mask_chunk = ref_mask_chunks[chunk_id]
+
                     noise = torch.randn_like(latent)
                     noisy_latent = scheduler.add_noise(latent, noise, timesteps)
-                    # noisy_latent = noisy_latent * (1. - ref_mask_chunk) + ref_latent * ref_mask_chunk
+                    noisy_latent = noisy_latent * (1. - ref_mask_chunk) + ref_latent * ref_mask_chunk
+                    
                     noisy_latents.append(noisy_latent.to(dtype=weight_dtype))
                     sequence_infos.append((False, torch.arange(0, latent.shape[1], device=accelerator.device)))
                 B, F_z, C, H_z, W_z = latent_chunks[0].shape
                 zero_cond = [torch.zeros((B, F_z, 1, H_z, W_z), dtype=weight_dtype, device=accelerator.device)] * len(latent)
                 # Predict the noise residual
+                # with torch.autograd.detect_anomaly():
+
                 model_outputs = transformer(
                     hidden_states=noisy_latents,
                     encoder_hidden_states=text_embeds,
                     audio_embeds=audio_encoding,
-                    condition=zero_cond,
+                    condition=cond_chunks,
                     sequence_infos=sequence_infos,
                     timestep=timesteps,
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
                 )[0]
-
+                print(model_outputs)
                 model_output = torch.cat(model_outputs, dim=1)
                 model_input = torch.cat(latent_chunks, dim=1)
                 noisy_input = torch.cat(noisy_latents, dim=1)
 
-                # print("model_output", model_output.min(), model_output.max())
-                model_pred = scheduler.get_velocity(model_output, noisy_input, timesteps)
+                ref_mask = torch.cat(ref_mask_chunks, dim=1)
+                non_ref_mask = 1. - ref_mask
 
+                model_pred = scheduler.get_velocity(model_output, noisy_input, timesteps)
+                eps = 1e-6
                 alphas_cumprod = scheduler.alphas_cumprod[timesteps]
-                weights = 1 / (1 - alphas_cumprod)
+                weights = 1 / (1 - alphas_cumprod).clamp(min=eps)
                 while len(weights.shape) < len(model_pred.shape):
                     weights = weights.unsqueeze(-1)
 
                 target = model_input
 
                 loss = (weights * (model_pred - target) ** 2)
-                # loss = loss * non_ref_mask / non_ref_mask.mean()
+                loss = loss * non_ref_mask / non_ref_mask.mean().clamp(min=eps)
                 loss = torch.mean(loss.reshape(batch_size, -1), dim=1)
-                loss = loss.mean()
+                loss = loss.mean() 
                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    params_to_clip = transformer.parameters()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+            if accelerator.sync_gradients:
+                params_to_clip = transformer.parameters()
+                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                if accelerator.state.deepspeed_plugin is None:
-                    optimizer.step()
-                    optimizer.zero_grad()
+            if accelerator.state.deepspeed_plugin is None:
+                optimizer.step()
+                optimizer.zero_grad()
 
-                lr_scheduler.step(global_step)
+            lr_scheduler.step(global_step)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1223,8 +1385,11 @@ def main(args):
                             'global_step': global_step,
                             'epoch': epoch,
                         }
+                        if model_config_yaml["use_audio"]:
+                            save_dict['audio_state_dict'] = unwrap_model(audio_model).state_dict()
                         torch.save(save_dict, save_path)
                         logger.info(f"Saved state to {save_path}")
+
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

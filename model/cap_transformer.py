@@ -637,7 +637,6 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
         batch_size, _, _, height, width = hidden_states[-1].shape
         num_frames_list = [hidden_state.shape[1] for hidden_state in hidden_states]
         num_frames = sum(num_frames_list)
-
         # 2. Patch embedding
         hidden_states = self.patch_embed(
             audio_embeds=audio_embeds,
@@ -647,7 +646,7 @@ class CAPVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Cac
             sequence_infos=sequence_infos,
         )
         hidden_states = self.embedding_dropout(hidden_states)
-
+        
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]

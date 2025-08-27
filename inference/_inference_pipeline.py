@@ -16,63 +16,15 @@ from diffusers.models import AutoencoderKLCogVideoX
 from diffusers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import CogVideoXLoraLoaderMixin
+from original.dit import CAPVideoXTransformer3DModel
 
-from cap_video.cap_transformer import CAPVideoXTransformer3DModel
+def encode_video(vae, video):
+    video = video.to(vae.device, dtype=vae.dtype)
+    video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+    with torch.no_grad():
+        latent_dist = vae.encode(video).latent_dist.sample() * vae.config.scaling_factor
+    return latent_dist.permute(0, 2, 1, 3, 4).to(memory_format=torch.contiguous_format)
 
-
-@dataclass
-class CapVideoPipelineOutput:
-    r"""
-    Output class for CAP-Video pipelines.
-    """
-    frames: torch.Tensor
-    latents: torch.Tensor
-
-
-def resize_for_crop(image, crop_h, crop_w):
-    img_h, img_w = image.shape[-2:]
-    if img_h >= crop_h and img_w >= crop_w:
-        coef = max(crop_h / img_h, crop_w / img_w)
-    elif img_h <= crop_h and img_w <= crop_w:
-        coef = max(crop_h / img_h, crop_w / img_w)
-    else:
-        coef = crop_h / img_h if crop_h > img_h else crop_w / img_w 
-    out_h, out_w = int(img_h * coef), int(img_w * coef)
-    resized_image = transforms.functional.resize(image, (out_h, out_w), antialias=True)
-    return resized_image
-
-
-def prepare_frames(input_images, video_size, do_resize=True, do_crop=True):
-    input_images = np.stack([np.array(x) for x in input_images])
-    images_tensor = torch.from_numpy(input_images).permute(0, 3, 1, 2) / 127.5 - 1
-    if do_resize:
-        images_tensor = [resize_for_crop(x, crop_h=video_size[0], crop_w=video_size[1]) for x in images_tensor]
-    if do_crop:
-        images_tensor = [transforms.functional.center_crop(x, video_size) for x in images_tensor]
-    if isinstance(images_tensor, list):
-        images_tensor = torch.stack(images_tensor)
-    return images_tensor.unsqueeze(0) 
-
-
-def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
-    tw = tgt_width
-    th = tgt_height
-    h, w = src
-    r = h / w
-    if r > (th / tw):
-        resize_height = th
-        resize_width = int(round(th / h * w))
-    else:
-        resize_width = tw
-        resize_height = int(round(tw / w * h))
-
-    crop_top = int(round((th - resize_height) / 2.0))
-    crop_left = int(round((tw - resize_width) / 2.0))
-
-    return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
-
-
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
     num_inference_steps: Optional[int] = None,
@@ -130,7 +82,15 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
-    
+
+@dataclass
+class CapVideoPipelineOutput:
+    r"""
+    Output class for CAP-Video pipelines.
+    """
+    frames: torch.Tensor
+    latents: torch.Tensor
+
 
 class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
     _optional_components = []
@@ -155,10 +115,12 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             vae=vae, transformer=transformer, scheduler=scheduler
         )
         self.vae_scale_factor_spatial = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
+            # 2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
+            8
         )
         self.vae_scale_factor_temporal = (
-            self.vae.config.temporal_compression_ratio if hasattr(self, "vae") and self.vae is not None else 4
+            # self.vae.config.temporal_compression_ratio if hasattr(self, "vae") and self.vae is not None else 4
+            4
         )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
@@ -192,7 +154,7 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]
-        latents = 1 / self.vae.config.scaling_factor * latents
+        latents = latents
 
         frames = self.vae.decode(latents).sample
         return frames
@@ -416,25 +378,9 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 noisy_latent = randn_tensor(
                     latents[chunk_id].shape, generator, device, latents[chunk_id].dtype,
                 )
-                # noisy_latent = randn_tensor(
-                #     latents[chunk_id].shape, generator, device, conditioning[-1].dtype,
-                # )
-            # noisy_latent = self.prepare_latents(
-            #     batch_size * num_videos_per_prompt,
-            #     num_channels_latents=latents[chunk_id].shape[2],
-            #     num_frames=latents[chunk_id].shape[1],
-            #     height=latents[chunk_id].shape[-2],
-            #     width=latents[chunk_id].shape[-1],
-            #     dtype=conditioning[-1].dtype,
-            #     device=device,
-            #     generator=generator,
-            #     latents=latents[chunk_id] if sequence_infos[chunk_id][0] else None,
-            # )
             initial_latents.append(noisy_latent)
 
             ref_latent = latents[chunk_id]
-            # if do_classifier_free_guidance:
-            #     ref_latent = torch.cat([ref_latent, uncond_latents[chunk_id]], dim=0)
             ref_latents.append(ref_latent)
 
         latents = initial_latents
@@ -457,41 +403,28 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
             old_pred_original_samples = [None] * len(latents)
             for i, t in enumerate(timesteps):
 
-                # if self.interrupt:
-                #     continue
+                if self.interrupt:
+                    continue
                 
                 latent_model_inputs = []
                 uncond_latent_model_inputs = []
                 for latent, ref_latent, uncond_ref_latent, ref_mask in zip(
                     latents, ref_latents, uncond_ref_latents, ref_mask_chunks
                 ):
-                    # latent_model_input = torch.cat([latent] * 2, dim=0) if do_classifier_free_guidance else latent
                     latent_model_input = latent
                     latent_model_input = latent_model_input * (1. - ref_mask) + ref_latent * ref_mask
                     latent_model_input = latent_model_input.to(dtype=self.transformer.dtype)
                     latent_model_inputs.append(latent_model_input)
+                
 
                     uncond_latent_model_input = latent
                     uncond_latent_model_input = uncond_latent_model_input * (1. - ref_mask) + uncond_ref_latent * ref_mask
                     uncond_latent_model_input = uncond_latent_model_input.to(dtype=self.transformer.dtype)
                     uncond_latent_model_inputs.append(uncond_latent_model_input)
-
-                # conditioning_input = []
-                # if do_classifier_free_guidance:
-                #     for cond, uncond in zip(conditioning, uncond_conditioning):
-                #         conditioning_input.append(torch.cat([cond, uncond]))
-                #     audio_input = torch.cat([audio_embeds, uncond_audio_embeds])
-                #     text_input = torch.cat([text_embeds, uncond_text_embeds])
-                # else:
-                #     conditioning_input = conditioning
-                #     text_input = text_embeds
-                #     audio_input = audio_embeds
                 
                 timestep = t.expand(latent_model_inputs[0].shape[0])
 
                 current_sampling_percent = i / len(timesteps)
-
-                # prompt_embeds = torch.zeros(batch_size, 1, 4096, dtype=self.transformer.dtype, device=self.transformer.device)
 
                 if do_classifier_free_guidance:
                     if cfg_mode == "separate":
@@ -513,7 +446,7 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                                 image_rotary_emb=image_rotary_emb,
                                 return_dict=False,
                                 growth_factor=growth_factor,
-                                cam_condition=cam_conditioning, # NOT USED
+                                # cam_condition=cam_conditioning, # NOT USED
                             )
                             view_noise_pred = list(view_noise_pred)
 
@@ -531,10 +464,11 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                             image_rotary_emb=image_rotary_emb,
                             return_dict=False,
                             growth_factor=growth_factor,
-                            cam_condition=cam_conditioning, # NOT USED
+                            # cam_condition=cam_conditioning, # NOT USED
                         )
                 else:
                     uncond_noise_preds = [[None]] * len(sequence_infos)
+                    
 
                 # predict noise model_output
                 noise_preds = self.call_transformer(
@@ -547,16 +481,15 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     image_rotary_emb=image_rotary_emb,
                     return_dict=False,
                     growth_factor=growth_factor,
-                    cam_condition=cam_conditioning,
+                    # cam_condition=cam_conditioning,
                 )
-
                 new_latents = []
                 new_old_pred_original_samples = []
+
                 for noise_pred, noise_pred_uncond, latent, old_pred_original_sample, ref_latent, ref_mask, gs in zip(
                     noise_preds, uncond_noise_preds, latents, old_pred_original_samples, ref_latents, ref_mask_chunks, guidance_scale
                 ):
                     noise_pred = noise_pred.float()
-
                     # perform guidance
                     if use_dynamic_cfg:
                         # assert False
@@ -576,6 +509,7 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                         #     noise_pred_uncond, noise_pred = noise_pred.chunk(2)  # TODO: DEBUG!!!!!!
                         noise_pred = noise_pred_uncond + gs * (noise_pred - noise_pred_uncond)
                         # ref_latent, _ = ref_latent.chunk(2)
+                    
 
                     # compute the previous noisy sample x_t -> x_t-1
                     if not isinstance(self.scheduler, CogVideoXDPMScheduler):
@@ -591,13 +525,12 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                             **extra_step_kwargs,
                             return_dict=False,
                         )
-
                     latent = latent * (1. - ref_mask) + ref_latent * ref_mask
                     
                     latent = latent.to(audio_embeds.dtype)
                     new_latents.append(latent)
                     new_old_pred_original_samples.append(old_pred_original_sample)
-                
+
                 latents = new_latents
                 old_pred_original_samples = new_old_pred_original_samples
 
@@ -633,4 +566,4 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         if not return_dict:
             return (videos,)
 
-        return CapVideoPipelineOutput(frames=videos, latents=latents)
+        return videos, latents

@@ -121,7 +121,8 @@ class LPIPSWithDiscriminator3D(nn.Module):
         last_layer=None,
         wavelet_coeffs=None,
         student_latents=None,
-        teacher_latents=None
+        teacher_latents=None,
+        vertex_loss=0.0
     ):
         bs = inputs.shape[0]
         t = inputs.shape[2]
@@ -185,6 +186,7 @@ class LPIPSWithDiscriminator3D(nn.Module):
                 + d_weight * disc_factor * g_loss
                 + self.wavelet_weight * wl_loss
                 + self.distill_weight * distill_loss
+                + vertex_loss
             )
             log = {
                 "{}/total_loss".format(split): loss.clone().detach().mean(),
@@ -197,6 +199,7 @@ class LPIPSWithDiscriminator3D(nn.Module):
                 "{}/d_weight".format(split): d_weight.detach(),
                 "{}/disc_factor".format(split): torch.tensor(disc_factor),
                 "{}/g_loss".format(split): g_loss.detach().mean(),
+                "{}/vertex_loss".format(split): vertex_loss.detach().mean()
             }
             return loss, log
         elif optimizer_idx == 1: # Discriminator
@@ -287,6 +290,7 @@ class VQLPIPSWithDiscriminator3D(nn.Module):
         student_latents=None,
         teacher_latents=None,
         cond=None,
+        vertex_loss=0.0,
     ):
         bs = inputs.shape[0]
         t = inputs.shape[2]
@@ -342,6 +346,7 @@ class VQLPIPSWithDiscriminator3D(nn.Module):
                 + self.wavelet_weight * wl_loss
                 + self.distill_weight * distill_loss
                 + self.codebook_weight * codebook_loss.mean()
+                + vertex_loss
             )
             
             log = {
@@ -355,6 +360,8 @@ class VQLPIPSWithDiscriminator3D(nn.Module):
                 "{}/d_weight".format(split): d_weight.detach(),
                 "{}/disc_factor".format(split): torch.tensor(disc_factor),
                 "{}/g_loss".format(split): g_loss.detach().mean(),
+                "{}/g_loss".format(split): g_loss.detach().mean(),
+                "{}/vertex_loss".format(split) : vertex_loss.detach.mean()
             }
             return loss, log
         elif optimizer_idx == 1:

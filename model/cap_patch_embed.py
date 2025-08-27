@@ -612,7 +612,7 @@ class CAPPatchEmbed(nn.Module):
             image_embeds (`torch.Tensor`):
                 Input image embeddings. Expected shape: (batch_size, num_frames, channels, height, width).
         """
-
+        
         n_latents = len(sequence_infos[-1][1])
         n_frames = (n_latents - 1) * self.temporal_compression_ratio + 1
         # reshape audio embeddings to fit number of frames

@@ -113,7 +113,12 @@ class TrainVideoDataset(data.Dataset):
         #     if self.is_main_process:
         #         with open(cache_file, "wb") as f:
         #             pickle.dump(samples, f)
-        samples = [os.path.join(os.path.join(self.video_folder, data), "fit.npz") for data in os.listdir(self.video_folder)]
+        bad = "5EuPFh6M1b4_00"
+        samples = [
+            os.path.join(self.video_folder, d, "fit.npz")
+            for d in os.listdir(self.video_folder)
+            if d != bad
+        ]        
         return samples[:-100]
 
     def __len__(self):
