@@ -20,7 +20,7 @@ from accelerate.logging import get_logger
 from data.VideoDataset import VideoDataset 
 from torch.utils.data import DataLoader, DistributedSampler
 
-from diffusers import CogVideoXDDIMScheduler
+from model.scheduler import CogVideoXDDIMScheduler
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from original.dit import CAPVideoXTransformer3DModel
@@ -253,8 +253,14 @@ def main(args):
         vae.load_state_dict(vae_ckpt["state_dict"],  strict=False)
         print("WF VAE checkpoint loaded!")
 
-    scheduler = CogVideoXDPMScheduler.from_pretrained(
+    scheduler = CogVideoXDDIMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
+    scheduler = CogVideoXDPMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.000000085,
+        beta_end=0.0120,
+        beta_schedule="scaled_linear"
     )
 
     vae.to(weight_dtype)

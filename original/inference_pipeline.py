@@ -617,8 +617,7 @@ class CAPVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
                     # compute the previous noisy sample x_t -> x_t-1
                     if not isinstance(self.scheduler, CogVideoXDPMScheduler):
-                        assert False
-                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                        latents = self.scheduler.step(noise_pred, t, latents, generator=generator, eta=0.01, return_dict=False)[0]
                     else:
                         latent, old_pred_original_sample = self.scheduler.step(
                             noise_pred,

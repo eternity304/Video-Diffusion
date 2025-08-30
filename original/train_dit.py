@@ -46,7 +46,7 @@ import cv2
 import warnings
 
 import diffusers
-from diffusers import AutoencoderKLCogVideoX, CogVideoXDPMScheduler
+from model.scheduler import CogVideoXDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, export_to_video, is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
@@ -876,7 +876,12 @@ def main(args):
         print("WF VAE checkpoint loaded!")
 
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-
+    scheduler = CogVideoXDPMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.000000085,
+        beta_end=0.0120,
+        beta_schedule="scaled_linear"
+    )
     # if args.enable_slicing:
     #     vae.enable_slicing()
     # if args.enable_tiling:
