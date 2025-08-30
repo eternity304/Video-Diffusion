@@ -501,12 +501,17 @@ def train(args):
             # Per Vertex Loss
             B, C, T, W, H = inputs.shape
             _recon = recon[:, :, :T, ...]
+
             l1_loss = nn.L1Loss()
             vertex_loss = l1_loss(
                 flame.sampleFromUV(_recon.permute(0,2,3,4,1).view(B*T, W, H, C)),
                 flame.sampleFromUV(inputs.permute(0,2,3,4,1).view(B*T, W, H, C))
             )
-            
+            smoothness_loss = torch.tensor([0.], dtype=torch.float32, device=model.device)
+
+            for i in range(B):
+                smoothness_loss += temporal_smoothness_loss(flame.sampleFromUV(_recon.permute(0,2,3,4,1)[i, ...]), order=2, penalty="l1")
+
             # generator loss
             if step_gen:
                 with torch.amp.autocast('cuda', dtype=precision):
@@ -519,7 +524,8 @@ def train(args):
                         last_layer=model.module.get_last_layer(),
                         wavelet_coeffs=wavelet_coeffs,
                         split="train",
-                        vertex_loss=vertex_loss
+                        vertex_loss=vertex_loss,
+                        smoothness_loss=smoothness_loss
                     )
                 gen_optimizer.zero_grad()
                 scaler.scale(g_loss).backward()
@@ -540,6 +546,9 @@ def train(args):
                     )
                     wandb.log(
                         {"train/latents_std": posterior.sample().std().item()}, step=current_step
+                    )
+                    wandb.log(
+                        {"train/smoothness_loss": smoothness_loss.item()}, step=current_step
                     )
 
             # discriminator loss
@@ -624,6 +633,69 @@ def train(args):
                 
     # end training
     dist.destroy_process_group()
+
+def _vector_norm(x, eps=1e-12):
+    # x: [..., D] -> [...], L2 norm per vertex
+    return torch.sqrt((x * x).sum(dim=-1) + eps)
+
+def _robust_penalty(r, kind="huber", delta=0.01, eps=1e-6):
+    """
+    r: [...], non-negative residual magnitudes (e.g., velocity norm)
+    kind: 'l2' | 'l1' | 'huber' | 'charbonnier' | 'tvl1'
+    """
+    if kind == "l2":
+        return (r * r).mean()
+    if kind == "l1" or kind == "tvl1":
+        return r.mean()  # TV-L1 is just L1 on the magnitude
+    if kind == "huber":
+        # piecewise: 0.5 r^2 (small), delta*(r - 0.5*delta) (large)
+        mask = (r <= delta).float()
+        return (0.5 * (r * r) * mask + (delta * (r - 0.5 * delta)) * (1 - mask)).mean()
+    if kind == "charbonnier":
+        # smooth L1: sqrt(r^2 + eps^2)
+        return torch.sqrt(r * r + eps * eps).mean()
+    raise ValueError(f"Unknown penalty kind: {kind}")
+
+def temporal_smoothness_loss(x, order=1, penalty="huber", delta=0.01,
+                             per_vertex_weights=None, valid_mask=None, dt=1.0):
+    """
+    x: [T, V, D] motion (e.g., vertex positions)
+    order: 1 (velocity), 2 (acceleration), 3 (jerk)
+    penalty: 'l2' | 'l1' | 'huber' | 'charbonnier' | 'tvl1'
+    per_vertex_weights: optional [V] or [T, V] weights
+    valid_mask: optional [T] bool/int to mask invalid frames (e.g., padding)
+    dt: time step; if not 1.0, we normalize differences by dt^order
+    """
+    assert x.dim() == 3, "x must be [T, V, D]"
+    # temporal differences along time
+    d = torch.diff(x, n=order, dim=0) / (dt ** order)  # [T - order, V, D]
+
+    # optional frame mask: shrink to the diff domain
+    if valid_mask is not None:
+        vm = valid_mask.bool()
+        for _ in range(order):
+            vm = vm[:-1] & vm[1:]
+        # vm now length T - order
+        d = d[vm]
+
+    # magnitude per vertex
+    r = _vector_norm(d)  # [..., V]
+
+    # optional per-vertex weighting
+    if per_vertex_weights is not None:
+        w = per_vertex_weights
+        if w.dim() == 1:      # [V]
+            r = r * w  # broadcasts over time
+        elif w.dim() == 2:    # [T or T-order, V]
+            # If original provided [T,V], trim the first 'order' frames to match diff
+            if w.shape[0] == x.shape[0]:
+                w = w[order:]
+            r = r * w
+        else:
+            raise ValueError("per_vertex_weights must be [V] or [T,V]")
+        r = r / (w.mean() + 1e-12)  # keep scale roughly invariant
+
+    return _robust_penalty(r, kind=penalty, delta=delta)
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Training")

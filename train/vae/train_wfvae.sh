@@ -18,7 +18,7 @@ export MKL_NUM_THREADS=1
 
 EXP_NAME=WFVAE
 
-torchrun --nproc_per_node=3 \
+torchrun --nproc_per_node=4 \
     -m train.vae.train_ddp \
     --exp_name ${EXP_NAME} \
     --pretrained_model_name_or_path /scratch/ondemand28/harryscz/other/WF-VAE/weight \
@@ -50,4 +50,4 @@ torchrun --nproc_per_node=3 \
     --sample_rate 1 \
     --disc_cls model.causalvideovae.model.losses.LPIPSWithDiscriminator3D \
     --wavelet_loss \
-    --wavelet_weight 0.1
+    --wavelet_weight 0.1 \

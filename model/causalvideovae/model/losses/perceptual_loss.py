@@ -122,7 +122,8 @@ class LPIPSWithDiscriminator3D(nn.Module):
         wavelet_coeffs=None,
         student_latents=None,
         teacher_latents=None,
-        vertex_loss=0.0
+        vertex_loss=0.0,
+        smoothness_loss=0.0,
     ):
         bs = inputs.shape[0]
         t = inputs.shape[2]
@@ -187,6 +188,7 @@ class LPIPSWithDiscriminator3D(nn.Module):
                 + self.wavelet_weight * wl_loss
                 + self.distill_weight * distill_loss
                 + vertex_loss
+                + smoothness_loss
             )
             log = {
                 "{}/total_loss".format(split): loss.clone().detach().mean(),
@@ -291,6 +293,7 @@ class VQLPIPSWithDiscriminator3D(nn.Module):
         teacher_latents=None,
         cond=None,
         vertex_loss=0.0,
+        smoothness_loss = 0.0,
     ):
         bs = inputs.shape[0]
         t = inputs.shape[2]
@@ -347,6 +350,7 @@ class VQLPIPSWithDiscriminator3D(nn.Module):
                 + self.distill_weight * distill_loss
                 + self.codebook_weight * codebook_loss.mean()
                 + vertex_loss
+                + smoothness_loss
             )
             
             log = {
