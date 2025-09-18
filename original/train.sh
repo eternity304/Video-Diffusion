@@ -28,7 +28,7 @@ CUDA_LAUNCH_BLOCKING=1 accelerate launch --config_file original/train_config.yam
   --model_config_path train/model_config.yaml \
   --audio_model_path /scratch/ondemand28/harryscz/model/wav2vec2-base \
   --dataset_config_path "" \
-  --load_checkpoint_if_exists 1 \
+  --load_checkpoint_if_exists 0 \
   --pretrained_model_name_or_path $MODEL_PATH \
   --vae_ckpt $VAE_PATH \
   --enable_tiling \

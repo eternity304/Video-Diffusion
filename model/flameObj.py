@@ -384,7 +384,7 @@ class Flame():
         images = renderer(customVerts)
         return images
 
-    def convertUV(self, uvPath="/scratch/ondemand28/harryscz/head_audio/head/head_template_mesh.obj", customSeq=None, rotation=True):
+    def convertUV(self, uvPath="/scratch/ondemand28/harryscz/head_audio/head/head_template_mesh.obj", customSeq=None, rotation=True, norm=True):
         # Load UV faces information
         verts, faces, aux = load_obj(uvPath)
 
@@ -410,7 +410,7 @@ class Flame():
             gMin = torch.tensor([-0.1124, -0.1944, -0.1546], dtype=torch.float32).to(self.device)
             gMax = torch.tensor([0.1093, 0.1337, 0.0895], dtype=torch.float32).to(self.device)
 
-        _seq = (seq - gMin) / (gMax - gMin)
+        _seq = (seq - gMin) / (gMax - gMin) if norm else seq
 
         r, g, b = _seq[:,:,0], _seq[:,:,1], _seq[:,:,2]
         colours = torch.stack([r,g,b], dim=2)
@@ -426,36 +426,48 @@ class Flame():
 
         return Meshes(verts=self.vertsUV3d, faces=self.facesUV3d, textures=uvTexture)
 
-    def fillBlackPixels(self, images, max_iter=50):
+    def fillBlackPixels(self, images, max_iter=50, threshold=1e-8, eps=1e-6):
         """
-        images: a tensor of shape (B, C, H, W) where black pixels are assumed to be [0,0,0].
-        max_iter: maximum number of iterations to avoid infinite loops.
-        
-        Returns a tensor with black pixels filled using nearest neighbor propagation.
+        images: (B, C, H, W) tensor. Black/missing pixels are all-zeros across channels.
+        Fills black pixels by averaging non-black neighbors (3x3) iteratively.
+        Works even if some channels are negative.
         """
-        # Create a binary mask where non-black pixels are 1
-        non_black_mask = (images != 0).any(dim=1, keepdim=True).float()
-        # Copy the original image to start filling
+        assert images.dim() == 4, "Expected (B, C, H, W)"
+        B, C, H, W = images.shape
+        device, dtype = images.device, images.dtype
+
         result = images.clone()
-        
-        iter_count = 0
-        # Loop until there are no black pixels or we hit the iteration limit
-        while (non_black_mask == 0).sum() > 0 and iter_count < max_iter:
-            # Use max pooling to dilate the image. It propagates non-zero (non-black) neighbors.
-            dilated = F.max_pool2d(result, kernel_size=3, stride=1, padding=1)
-            
-            # Create a mask for black pixels that now have a non-black neighbor from dilation
-            fill_mask = (non_black_mask == 0) & ((dilated != 0).any(dim=1, keepdim=True))
-            
-            # Only update the black pixels with the corresponding dilated values
-            # Use expand_as(result) to align the mask with the image channels.
-            result = torch.where(fill_mask.expand_as(result), dilated, result)
-            
-            # Update the mask based on the new values in result
-            non_black_mask = (result != 0).any(dim=1, keepdim=True).float()
-            iter_count += 1
-            
+
+        # A pixel is "non-black" if ANY channel is nonzero (within threshold)
+        non_black_mask = (result.abs() > threshold).any(dim=1, keepdim=True).float()  # (B,1,H,W)
+
+        # 3x3 ones kernel per channel for grouped convs
+        k = torch.ones((C, 1, 3, 3), device=device, dtype=dtype)
+
+        it = 0
+        while (non_black_mask == 0).any() and it < max_iter:
+            # Sum of neighbor values, but only count non-black pixels
+            # (Multiply by mask to zero-out black pixels before summing)
+            sum_vals = F.conv2d(result * non_black_mask, k, padding=1, groups=C)  # (B,C,H,W)
+
+            # Count of non-black neighbors per channel
+            # Expand mask to channels for grouped conv
+            ch_mask = non_black_mask.expand(-1, C, -1, -1)  # (B,C,H,W)
+            count = F.conv2d(ch_mask, k, padding=1, groups=C)  # (B,C,H,W)
+
+            # Average of *non-black* neighbors
+            new_vals = sum_vals / (count + eps)
+
+            # Fill where currently black but has at least one non-black neighbor
+            fill_mask = (non_black_mask == 0) & (count > 0)  # (B,1,H,W)
+            result = torch.where(fill_mask.expand_as(result), new_vals, result)
+
+            # Update mask
+            non_black_mask = (result.abs() > threshold).any(dim=1, keepdim=True).float()
+            it += 1
+
         return result
+
 
     def renderUV(self, uvMesh, savePath=None, resolution=256, fill=True):
         uvBlendParams = BlendParams(background_color=(0.0, 0.0, 0.0))
@@ -556,12 +568,12 @@ class Flame():
 
         self.facesUV3d = self.facesUV.unsqueeze(0).expand(self.nFrames, -1, -1)
 
-        epsilon = 1e-6
+        epsilon = 1e-8
         grid = self.vertsUV.clone()
         grid = grid.clamp(epsilon, 1.0 - epsilon)
 
         # x = 2*u - 1  maps [0,1]->[-1,+1]
-        grid[..., 0] = (1.0 - 2.0 * grid[..., 0] + 0.0005 - 0.001 ) * 1.05
+        grid[..., 0] = (1.0 - 2.0 * grid[..., 0] + 0.0005 - 0.001) 
         # y = 1 - 2*v  flips the v axis, if needed
         grid[..., 1] = 1.0 - 2.0 * grid[..., 1] - 0.025 + 0.0215
 
@@ -577,21 +589,24 @@ class Flame():
         sampledUV = F.grid_sample(
             perFrameUV,
             grid,
-            mode='nearest',
+            mode='bicubic',
             align_corners=True,
             padding_mode='border'   
         )
   
-        sampledUV = sampledUV.squeeze(-1).permute(0, 2, 1)[...,  :3] 
+        sampledUV = sampledUV.squeeze(-1).permute(0, 2, 1)[...,  :3] * 2.025
         
         sampledUVMesh = Meshes(verts=self.vertsUV3d, faces=self.facesUV3d, textures=TexturesVertex(verts_features=sampledUV))
 
         if savePath is not None: self.get_uv_animation(sampledUVMesh, savePath=savePath, resolution=resolution, fill=fill)
 
+        if returnMesh:
+            return sampledUV, sampledUVMesh
+        
         return sampledUV
     
 
-    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2, elev=0., azim=0., scale=1, resolution=256, rotation=True):
+    def sampleTo3D(self, sampledUV, savePath=None, dist=0.2, elev=0., azim=0., scale=1, resolution=256, norm=True, rotation=True, delta=None, denorm=None):
         self.nFrames, nVerts, nChannel = sampledUV.shape 
 
         _sampledUV = sampledUV.clone()
@@ -603,11 +618,15 @@ class Flame():
         sampledSeq = torch.zeros(self.nFrames, 5023, 3).to(self.device)
         sampledSeq[:, self.faces3d.view(-1),:] = faces3dFromUV[:, :, :]
 
-    
-        gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
-        gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
+        if delta is None and norm:
+            gMin = torch.tensor([-0.1776, -0.2074, -1.0983], dtype=torch.float32).to(self.device)
+            gMax = torch.tensor([ 0.1772,  0.1642, -0.6894], dtype=torch.float32).to(self.device)
 
-        perFrameVerts = (sampledSeq * (gMax - gMin) + gMin) * 3
+            perFrameVerts = (sampledSeq * (gMax - gMin) + gMin) * 3
+        elif delta is not None: 
+            perFrameVerts = delta[0:1,...] + sampledSeq
+        else:
+            perFrameVerts = sampledSeq
 
         self.nFrames, _, _ = perFrameVerts.shape
 

@@ -2,7 +2,7 @@
 
 export MODEL_PATH=/scratch/ondemand28/harryscz/model/CogVideoX-2b
 export DATASET_PATH="/scratch/ondemand28/harryscz/head_audio/data/data512/uv"
-export CHECKPOINT_PATH=/scratch/ondemand28/harryscz/diffusion/modelOut/diffusion/checkpoint-20000.pt
+export CHECKPOINT_PATH=/scratch/ondemand28/harryscz/diffusion/modelOut/diffusion/checkpoint-10000.pt
 export TRITON_CACHE_DIR="/scratch/ondemand28/harryscz/diffusion/trition_cache_dir"
 export VAE_PATH="/scratch/ondemand28/harryscz/diffusion/modelOut/vae/WFVAE-lr1.00e-05-bs1-rs256-sr1-fr25/checkpoint-44000.ckpt"
 

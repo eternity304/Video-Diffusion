@@ -201,7 +201,8 @@ class CogVideoXDPMScheduler(SchedulerMixin, ConfigMixin):
             self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = torch.linspace(beta_start**0.1, beta_end**0.1, num_train_timesteps, dtype=torch.float64) ** (1 / 0.1)
+            r = 0.20
+            self.betas = torch.linspace(beta_start**r, beta_end**r, num_train_timesteps, dtype=torch.float64) ** (1 / r)
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)

@@ -182,7 +182,7 @@ class LPIPSWithDiscriminator3D(nn.Module):
                 self.disc_factor, global_step, threshold=self.discriminator_iter_start
             )
             loss = (
-                weighted_nll_loss
+                weighted_nll_loss * 0.5
                 + self.kl_weight * kl_loss
                 + d_weight * disc_factor * g_loss
                 + self.wavelet_weight * wl_loss

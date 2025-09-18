@@ -29,6 +29,65 @@ try:
 except:
     raise Exception("Need lpips to valid.")
 
+def norm_c(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a tensor of shape [T, V, 3] to [-1, 1] per channel.
+
+    Args:
+        x (torch.Tensor): Input tensor with shape [T, V, 3].
+
+    Returns:
+        torch.Tensor: Normalized tensor with same shape, values in [-1, 1].
+    """
+    if x.ndim != 3 or x.shape[-1] != 3:
+        raise ValueError("Input must have shape [T, V, 3]")
+
+    # Compute per-channel min and max
+    min_vals = torch.tensor([
+        -0.04849253594875336,
+        -0.046996183693408966,
+        -0.04760991781949997
+    ], device=x.device)
+    max_vals = torch.tensor([
+        0.039129119366407394,
+        0.05402204394340515,
+        0.03667855262756348
+    ], device=x.device)
+
+    # Avoid division by zero
+    denom = (max_vals - min_vals).clamp(min=1e-10)
+
+    # Normalize [0,1], then scale [-1,1]
+    x_norm = 2 * (x - min_vals) / denom - 1 
+
+    return x_norm, min_vals, max_vals
+
+def batch_delta_uv(head, path_list, sample_frames=50, resolution=256, rotation=False, norm=False):
+    out = []
+    min_frame = 1e8
+
+    for path in path_list:
+        head.loadSequence(path)
+
+        id = head.LSB(rotation=False, identity=True)
+        seq = head.LSB(rotation=False)
+        
+        first = seq[0:1, ...] - id[0:1, ...]     # Get first difference from identity to sequence
+        remainder = seq[1:, ...] - seq[:-1, ...]
+        delta = torch.cat([first, remainder], dim=0).cumsum(dim=0)
+
+        normed, _, _ = norm_c(delta)
+        uvMesh = head.convertUV(customSeq=normed, rotation=False, norm=norm)
+
+        frame, _, _ = normed.shape    
+        if frame < min_frame: min_frame = frame
+         
+        uv = head.get_uv_animation(uvMesh, resolution=resolution, sample_frames=sample_frames) 
+        out.append(uv[..., :3].unsqueeze(0))
+
+    out = [item[:, :min_frame, ...] for item in out]
+    return torch.concat(out, dim=0)
+
 def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -135,8 +194,13 @@ def valid(global_rank, rank, model, val_dataloader, precision, flame, args):
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             # inputs = batch["video"].to(rank)
-            inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution).permute(0,4,1,2,3)
-            inputs = inputs.to(rank)
+            inputs = batch_delta_uv(
+                flame,
+                batch,
+                sample_frames=args.num_frames
+            ).permute(0,4,1,2,3).to(rank) 
+            # inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution).permute(0,4,1,2,3)
+            # inputs = inputs.to(rank)
 
             with torch.amp.autocast("cuda", dtype=precision):
                 output = model(inputs)
@@ -439,9 +503,9 @@ def train(args):
 
     num_epochs = args.epochs
 
-    def update_bar(bar):
+    def update_bar(bar, v_loss):
         if global_rank == 0:
-            bar.desc = bar_desc.format(current_epoch=epoch, loss=f"-")
+            bar.desc = bar_desc.format(current_epoch=epoch, loss=f"{v_loss}")
             bar.update()
     
     # training Loop
@@ -452,8 +516,13 @@ def train(args):
         for batch_idx, batch in enumerate(dataloader):
         # for batch_idx, batch in enumerate(islice(dataloader, 1200, None), start=1200):
             # inputs = batch["video"].to(rank)
-            inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution)
-            inputs = inputs.permute(0,4,1,2,3).to(rank)
+            inputs = batch_delta_uv(
+                flame,
+                batch,
+                sample_frames=args.num_frames
+            ).permute(0,4,1,2,3).to(rank) 
+            # inputs = flame.batch_uv(batch, sample_frames=args.num_frames, resolution=args.resolution)
+            # inputs = inputs.permute(0,4,1,2,3).to(rank)
 
             # Check for bad input
             bad_loc = torch.tensor(
@@ -468,7 +537,7 @@ def train(args):
             if bad_loc.item():  # if ANY rank saw a mismatch
                 if inputs.shape[2] != args.num_frames:
                     print(f" Skipping bad batch on rank {rank} @ step {current_step}", batch, inputs.shape)
-                update_bar(bar)
+                update_bar(bar, v_loss=None)
                 current_step += 1
                 continue
             
@@ -504,14 +573,10 @@ def train(args):
 
             l1_loss = nn.L1Loss()
             vertex_loss = l1_loss(
-                flame.sampleFromUV(_recon.permute(0,2,3,4,1).view(B*T, W, H, C)),
-                flame.sampleFromUV(inputs.permute(0,2,3,4,1).view(B*T, W, H, C))
+                flame.sampleFromUV(_recon.permute(0,2,3,4,1).view(B*T, W, H, C), fill=False),
+                flame.sampleFromUV(inputs.permute(0,2,3,4,1).view(B*T, W, H, C), fill=False)
             )
-            smoothness_loss = torch.tensor([0.], dtype=torch.float32, device=model.device)
-
-            for i in range(B):
-                smoothness_loss += temporal_smoothness_loss(flame.sampleFromUV(_recon.permute(0,2,3,4,1)[i, ...]), order=2, penalty="l1")
-
+    
             # generator loss
             if step_gen:
                 with torch.amp.autocast('cuda', dtype=precision):
@@ -525,13 +590,12 @@ def train(args):
                         wavelet_coeffs=wavelet_coeffs,
                         split="train",
                         vertex_loss=vertex_loss,
-                        smoothness_loss=smoothness_loss
                     )
                 gen_optimizer.zero_grad()
                 scaler.scale(g_loss).backward()
                 scaler.step(gen_optimizer)
                 scaler.update()
-                
+
                 # update ema
                 if args.ema:
                     ema.update()
@@ -548,7 +612,7 @@ def train(args):
                         {"train/latents_std": posterior.sample().std().item()}, step=current_step
                     )
                     wandb.log(
-                        {"train/smoothness_loss": smoothness_loss.item()}, step=current_step
+                        {"train/vertex_loss": vertex_loss.item()}, step=current_step
                     )
 
             # discriminator loss
@@ -573,7 +637,7 @@ def train(args):
                         {"train/discriminator_loss": d_loss.item()}, step=current_step
                     )
 
-            update_bar(bar)
+            update_bar(bar, v_loss=vertex_loss.item())
             current_step += 1
 
             # valid model
@@ -655,47 +719,6 @@ def _robust_penalty(r, kind="huber", delta=0.01, eps=1e-6):
         # smooth L1: sqrt(r^2 + eps^2)
         return torch.sqrt(r * r + eps * eps).mean()
     raise ValueError(f"Unknown penalty kind: {kind}")
-
-def temporal_smoothness_loss(x, order=1, penalty="huber", delta=0.01,
-                             per_vertex_weights=None, valid_mask=None, dt=1.0):
-    """
-    x: [T, V, D] motion (e.g., vertex positions)
-    order: 1 (velocity), 2 (acceleration), 3 (jerk)
-    penalty: 'l2' | 'l1' | 'huber' | 'charbonnier' | 'tvl1'
-    per_vertex_weights: optional [V] or [T, V] weights
-    valid_mask: optional [T] bool/int to mask invalid frames (e.g., padding)
-    dt: time step; if not 1.0, we normalize differences by dt^order
-    """
-    assert x.dim() == 3, "x must be [T, V, D]"
-    # temporal differences along time
-    d = torch.diff(x, n=order, dim=0) / (dt ** order)  # [T - order, V, D]
-
-    # optional frame mask: shrink to the diff domain
-    if valid_mask is not None:
-        vm = valid_mask.bool()
-        for _ in range(order):
-            vm = vm[:-1] & vm[1:]
-        # vm now length T - order
-        d = d[vm]
-
-    # magnitude per vertex
-    r = _vector_norm(d)  # [..., V]
-
-    # optional per-vertex weighting
-    if per_vertex_weights is not None:
-        w = per_vertex_weights
-        if w.dim() == 1:      # [V]
-            r = r * w  # broadcasts over time
-        elif w.dim() == 2:    # [T or T-order, V]
-            # If original provided [T,V], trim the first 'order' frames to match diff
-            if w.shape[0] == x.shape[0]:
-                w = w[order:]
-            r = r * w
-        else:
-            raise ValueError("per_vertex_weights must be [V] or [T,V]")
-        r = r / (w.mean() + 1e-12)  # keep scale roughly invariant
-
-    return _robust_penalty(r, kind=penalty, delta=delta)
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Training")

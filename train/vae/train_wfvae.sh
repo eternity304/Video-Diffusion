@@ -32,8 +32,8 @@ torchrun --nproc_per_node=4 \
     --resolution 256 \
     --num_frames 25 \
     --batch_size 1 \
-    --lr 0.00001 \
-    --epochs 10 \
+    --lr 0.000001 \
+    --epochs 20 \
     --disc_start 0 \
     --log_steps 1 \
     --save_ckpt_step 500 \
@@ -51,3 +51,4 @@ torchrun --nproc_per_node=4 \
     --disc_cls model.causalvideovae.model.losses.LPIPSWithDiscriminator3D \
     --wavelet_loss \
     --wavelet_weight 0.1 \
+    # --resume_from_checkpoint /scratch/ondemand28/harryscz/diffusion/modelOut/vae/WFVAE-lr1.00e-05-bs1-rs256-sr1-fr25/checkpoint-42500.ckpt

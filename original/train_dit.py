@@ -602,6 +602,56 @@ def batch_audio(paths, n_timesteps, audio_processor):
 
     return torch.concat(out_audio, dim=0), torch.concat(out_positions, dim=0)
 
+def norm_c(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a tensor of shape [T, V, 3] to [-1, 1] per channel.
+
+    Args:
+        x (torch.Tensor): Input tensor with shape [T, V, 3].
+
+    Returns:
+        torch.Tensor: Normalized tensor with same shape, values in [-1, 1].
+    """
+    if x.ndim != 3 or x.shape[-1] != 3:
+        raise ValueError("Input must have shape [T, V, 3]")
+
+    # Compute per-channel min and max
+    min_vals = x.amin(dim=(0, 1), keepdim=True)  # shape [1,1,3]
+    max_vals = x.amax(dim=(0, 1), keepdim=True)  # shape [1,1,3]
+
+    # Avoid division by zero
+    denom = (max_vals - min_vals).clamp(min=1e-8)
+
+    # Normalize [0,1], then scale [-1,1]
+    x01 = (x - min_vals) / denom
+    x_norm = x01 * 2 - 1
+    return x_norm, min_vals, max_vals
+
+def batch_delta_uv(head, path_list, min_frame=50, sample_frames=50, resolution=256, rotation=False, norm=False):
+    out = []
+    min_frame = 1e8
+
+    for path in path_list:
+        head.loadSequence(path)
+
+        id = head.LSB(rotation=False, identity=True)
+        seq = head.LSB(rotation=False)
+
+        first = seq[0:1, ...] - id[0:1, ...]     # Get first difference from identity to sequence
+        remainder = seq[1:, ...] - seq[:-1, ...]
+        delta = torch.cat([first, remainder], dim=0).cumsum(dim=0)
+        
+        normed, _, _ = norm_c(delta)
+        uvMesh = head.convertUV(customSeq=normed, rotation=False, norm=norm)
+
+        frame, _, _ = normed.shape    
+        if frame < min_frame: min_frame = frame                                       
+        uv = head.get_uv_animation(uvMesh, resolution=resolution, sample_frames=sample_frames) 
+        out.append(uv[..., :3].unsqueeze(0))
+
+    out = [item[:, :min_frame, ...] for item in out]
+    return torch.concat(out, dim=0)
+
 # def prepare_rotary_positional_embeddings(
 #     height: int,
 #     width: int,
@@ -878,9 +928,11 @@ def main(args):
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     scheduler = CogVideoXDPMScheduler(
         num_train_timesteps=1000,
-        beta_start=0.000000085,
+        beta_start=8.5e-8,
         beta_end=0.0120,
-        beta_schedule="scaled_linear"
+        beta_schedule="scaled_linear",
+        prediction_type="v_prediction",
+        rescale_betas_zero_snr="True"
     )
     # if args.enable_slicing:
     #     vae.enable_slicing()
@@ -1154,11 +1206,11 @@ def main(args):
                 latent_chunks = []
                 cond_chunks = []
                 ref_mask_chunks = []
-               
+     
                 try:
-                    uvs = head.batch_uv(
-                        batch, resolution=model_config_yaml["width"], 
-                        sample_frames=args.sample_frames, rotation=False
+                    uvs = batch_delta_uv(
+                        head,
+                        batch
                     ).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
                 except:
                     print(batch)

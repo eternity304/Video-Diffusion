@@ -20,7 +20,7 @@ from accelerate.logging import get_logger
 from data.VideoDataset import VideoDataset 
 from torch.utils.data import DataLoader, DistributedSampler
 
-from model.scheduler import CogVideoXDDIMScheduler
+from model.scheduler import CogVideoXDPMScheduler
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from original.dit import CAPVideoXTransformer3DModel
@@ -30,6 +30,65 @@ from model.causalvideovae.model import *
 from original.inference_pipeline import *
 from data.VideoDataset import *
 from wf_vae.model import *
+
+def norm_c(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a tensor of shape [T, V, 3] to [-1, 1] per channel.
+
+    Args:
+        x (torch.Tensor): Input tensor with shape [T, V, 3].
+
+    Returns:
+        torch.Tensor: Normalized tensor with same shape, values in [-1, 1].
+    """
+    if x.ndim != 3 or x.shape[-1] != 3:
+        raise ValueError("Input must have shape [T, V, 3]")
+
+    # Compute per-channel min and max
+    min_vals = x.amin(dim=(0, 1), keepdim=True)  # shape [1,1,3]
+    max_vals = x.amax(dim=(0, 1), keepdim=True)  # shape [1,1,3]
+
+    # Avoid division by zero
+    denom = (max_vals - min_vals).clamp(min=1e-8)
+
+    # Normalize [0,1], then scale [-1,1]
+    x01 = (x - min_vals) / denom
+    x_norm = x01 * 2 - 1
+    return x_norm, min_vals, max_vals
+
+def batch_delta_uv(head, path_list, min_frame=50, sample_frames=50, resolution=256, rotation=False, norm=False):
+    out = []
+    min_frame = 1e8
+
+    for path in path_list:
+        head.loadSequence(path)
+
+        id = head.LSB(rotation=False, identity=True)
+        seq = head.LSB(rotation=False)
+
+        first = seq[0:1, ...] - id[0:1, ...]     # Get first difference from identity to sequence
+        remainder = seq[1:, ...] - seq[:-1, ...]
+        delta = torch.cat([first, remainder], dim=0).cumsum(dim=0)
+        
+        normed, _, _ = norm_c(delta)
+        uvMesh = head.convertUV(customSeq=normed, rotation=False, norm=norm)
+
+        frame, _, _ = normed.shape    
+        if frame < min_frame: min_frame = frame                                       
+        uv = head.get_uv_animation(uvMesh, resolution=resolution, sample_frames=sample_frames) 
+        out.append(uv[..., :3].unsqueeze(0))
+
+    out = [item[:, :min_frame, ...] for item in out]
+    return torch.concat(out, dim=0)
+
+def denorm_c(x_norm: torch.Tensor, min_vals: torch.Tensor, max_vals: torch.Tensor):
+    """
+    Invert the normalization: [-1,1] → original range.
+    """
+    denom = (max_vals - min_vals).clamp(min=1e-8)
+    x01 = (x_norm + 1) / 2
+    x = x01 * denom + min_vals
+    return x
 
 def parse_args(arg_list=None):
     parser = argparse.ArgumentParser(description="Unconditioned Video Diffusion Inference")
@@ -232,6 +291,7 @@ def main(args):
         ignore_mismatched_sizes=True,
         subfolder="transformer",
         torch_dtype=torch.float32,
+        num_layers=32,
         cond_in_channels=16,  # only one channel (the ref_mask)
         sample_width=model_config["width"] // 8,
         sample_height=model_config["height"] // 8,
@@ -253,14 +313,16 @@ def main(args):
         vae.load_state_dict(vae_ckpt["state_dict"],  strict=False)
         print("WF VAE checkpoint loaded!")
 
-    scheduler = CogVideoXDDIMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
+    # scheduler = CogVideoXDPMScheduler.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="scheduler"
+    # )
     scheduler = CogVideoXDPMScheduler(
         num_train_timesteps=1000,
-        beta_start=0.000000085,
+        beta_start=8.5e-8,
         beta_end=0.0120,
-        beta_schedule="scaled_linear"
+        beta_schedule="scaled_linear",
+        prediction_type="v_prediction",
+        rescale_betas_zero_snr="True"
     )
 
     vae.to(weight_dtype)
@@ -296,7 +358,11 @@ def main(args):
         uncond_chunks = []
         ref_mask_chunks = []
 
-        uvs = head.batch_uv(batch, resolution=256, sample_frames=args.sample_frames, rotation=False).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
+        # uvs = head.batch_uv(batch, resolution=256, sample_frames=args.sample_frames, rotation=False).permute(0,1,4,2,3) # load UVs of shape B, F, C, H, W
+        uvs = batch_delta_uv(
+            head,
+            batch
+        ).permute(0,1,4,2,3)
         # audio_chunks, sample_pos_chunks = batch_audio(batch, n_timesteps=args.sample_frames, audio_processor=audio_processor)
         # audio_chunks, sample_pos_chunks = audio_chunks.to(device=audio_model.device, dtype=weight_dtype), sample_pos_chunks.to(device=audio_model.device, dtype=weight_dtype)
         
@@ -369,19 +435,29 @@ def main(args):
             gt=latents.permute(0,2,1,3,4) * vae.config.scale[0]
         )
         
-        # breakpoint()
-        
+        min_x, max_x = torch.tensor([[[-0.0050, -0.0057, -0.0085]]], device=orig.device), torch.tensor([[[0.0085, 0.0066, 0.0024]]], device=orig.device)
+
+        head.loadSequence(dataPath[0])
+        id = head.LSB(rotation=False, identity=True)
+
         # recon = out[0][0][0].permute(0,2,3,1)
         recon = decode_video(vae, out[1][0])[0].permute(1,2,3,0)
 
         torch.save(orig, "diffOut/vae_gt.pt")
         torch.save(recon, "diffOut/overfit.pt")
-        
-        sampledUV = head.sampleFromUV(orig, savePath=f"diffOut/_no_{i}_uv.mp4") # input has shape F, H, W, C
-        head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_3d.mp4", resolution=512, dist=1.2, rotation=False)
 
-        sampledUV = head.sampleFromUV(recon, savePath=f"diffOut/_no_{i}_diff_uv.mp4") # input has shape F, H, W, C
-        head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_diff_3d.mp4", resolution=512, dist=1.2, rotation=False)
+        sampled_uv = head.sampleFromUV(recon, savePath="diffOut/cumsum_uv.mp4", resolution=512, fill=True)
+        head.sampleTo3D(denorm_c(sampled_uv, min_x, max_x), savePath="diffOut/cumsum_3d.mp4", rotation=False, delta=id, norm=False, dist=0.6, resolution=512)
+
+        sampled_gt = head.sampleFromUV(orig, savePath="diffOut/cumsum_uv_gt.mp4", resolution=512, fill=True)
+        head.sampleTo3D(denorm_c(sampled_gt, min_x, max_x), savePath="diffOut/cumsum_3d_gt.mp4", rotation=False, delta=id, norm=False, dist=0.6, resolution=512)
+
+        
+        # sampledUV = head.sampleFromUV(orig, savePath=f"diffOut/_no_{i}_uv.mp4") # input has shape F, H, W, C
+        # head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_3d.mp4", resolution=512, dist=1.2, rotation=False)
+
+        # sampledUV = head.sampleFromUV(recon, savePath=f"diffOut/_no_{i}_diff_uv.mp4") # input has shape F, H, W, C
+        # head.sampleTo3D(sampledUV, savePath=f"diffOut/_no_{i}_diff_3d.mp4", resolution=512, dist=1.2, rotation=False)
     
 
 if __name__ == "__main__":
